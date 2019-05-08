@@ -8,105 +8,190 @@ import sqlite3
 import pymysql
 import nmap as nm
 import ldap3
+from configparser import RawConfigParser, NoSectionError
 from pprint import pprint
 from datetime import datetime, timedelta
 from IPy import IP
-from configparser import RawConfigParser, NoSectionError
 
 __THIS_DIR = os.path.dirname(os.path.abspath(
     inspect.getframeinfo(inspect.currentframe()).filename
 ))
 __CONFIG_PATH = os.path.join(__THIS_DIR, "net.cfg")
 __NET_DB_PATH = os.path.join(__THIS_DIR, "net.db")
-__CONFIG_SECTION_NMAP = "nmap"
+__CONFIG_SECTION_GROUPS = "groups"
+__CONFIG_SECTION_GUACAMOLE = "guacamole"
 __CONFIG_SECTION_LDAP = "ldap"
+__CONFIG_SECTION_LINUX = "linux"
 __CONFIG_SECTION_MYSQL = "mysql"
+__CONFIG_SECTION_NMAP = "nmap"
+__CONFIG_SECTION_VNC = "vnc"
 __NMAP_DEFAULT_PORTS = '5899-5940,3389,23,22'
 __NMAP_DEFAULT_ARGUMENTS = '-O -sV'
 __NMAP_OPTIONS_NEEDING_ROOT = '-O -sS'
 
-class mysql_db:
+class config_section():
+    def __init__(self, path=None, section=None):
+        if path and os.path.isfile(path):
+            self.path = path
+        else:
+            self.path = super(config, self).path
+        if section:
+            self.section = section
+
+class config():
+
+    from configparser import RawConfigParser, NoSectionError
 
     def __init__(self, **kargs):
 
+        if 'path' in kargs.keys():
+            self.path = kargs['path']
+        else:
+            self.path = globals()['__CONFIG_PATH']
+
         parser = RawConfigParser()
-        parser.read(globals()['__CONFIG_PATH'])
-        try:
-            self.hostname = parser.get(
-                globals()['__CONFIG_SECTION_MYSQL'], "hostname"
-            )
-        except NoSectionError as e:
-            self.hostname = None
-        try:
-            self.username = parser.get(
-                globals()['__CONFIG_SECTION_MYSQL'], "username"
-            )
-        except NoSectionError as e:
-            self.username = None
-        try:
-            self.password = parser.get(
-                globals()['__CONFIG_SECTION_MYSQL'], "password"
-            )
-        except NoSectionError as e:
-            self.password = None
-        try:
-            self.database = parser.get(
-                globals()['__CONFIG_SECTION_MYSQL'], "database"
-            )
-        except NoSectionError as e:
-            self.database = None
-        try:
-            self.port = parser.get(
-                globals()['__CONFIG_SECTION_MYSQL'], "port"
-            )
-        except NoSectionError as e:
-            self.port = 3306
 
-        if 'hostname' in kargs.keys():
-            self.hostname = kargs['hostname']
+        def do(p, s, i):
+            try:
+                r = p.get(s, i).strip()
+            except NoSectionError as e:
+                r = None
+            return r
 
-        if 'password' in kargs.keys():
-            self.password = kargs['password']
+        self.nmap = config_section(
+            kargs['nmap'] if 'nmap' in kargs.keys() else self.path,
+            globals()['__CONFIG_SECTION_NMAP']
+        )
+        parser.read(self.nmap.path)
+        self.nmap.fqdn = do(parser, self.nmap.section, "fqdn")
+        self.nmap.ip_range = do(parser, self.nmap.section, "ip_range")
+        self.nmap.hosts = self.nmap.ip_range
 
-        if 'database' in kargs.keys():
-            self.database = kargs['database']
+        self.ldap = config_section(
+            kargs['ldap'] if 'ldap' in kargs.keys() else self.path,
+            globals()['__CONFIG_SECTION_LDAP']
+        )
+        parser.read(self.ldap.path)
+        self.ldap.dc = do(parser, self.ldap.section, "dc")
+        self.ldap.fqdn = do(parser, self.ldap.section, "fqdn")
+        self.ldap.domain = do(parser, self.ldap.section, "domain")
+        self.ldap.user = do(parser, self.ldap.section, "user")
+        self.ldap.password = do(parser, self.ldap.section, "password")
+        self.ldap.key_file = do(parser, self.ldap.section, "key_file")
 
-        if 'port' in kargs.keys():
-            self.port = kargs['port']
+        self.guacamole = config_section(
+            kargs['guacamole'] if 'guacamole' in kargs.keys() else self.path,
+            globals()['__CONFIG_SECTION_GUACAMOLE']
+        )
+        parser.read(self.guacamole.path)
+        self.guacamole.url = do(parser, self.guacamole.section, "url")
+        self.guacamole.group = do(parser, self.guacamole.section, "group")
+        self.guacamole.db_host = do(parser, self.guacamole.section, "db_host")
+        self.guacamole.db_user = do(parser, self.guacamole.section, "db_user")
+        self.guacamole.db_pass = do(parser, self.guacamole.section, "db_pass")
+        self.guacamole.db_name = do(parser, self.guacamole.section, "db_name")
+        self.guacamole.db_port = do(parser, self.guacamole.section, "db_port")
 
-        if self.hostname and self.username and self.password and self.database and self.port:
-            self.connect()
+        self.linux = config_section(
+            kargs['linux'] if 'linux' in kargs.keys() else self.path,
+            globals()['__CONFIG_SECTION_LINUX']
+        )
+        parser.read(self.linux.path)
+        self.linux.user = do(parser, self.linux.section, "user")
+        self.linux.password = do(parser, self.linux.section, "password")
+
+        self.vnc = config_section(
+            kargs['vnc'] if 'vnc' in kargs.keys() else self.path,
+            globals()['__CONFIG_SECTION_VNC']
+        )
+        parser.read(self.vnc.path)
+        self.vnc.port = do(parser, self.vnc.section, "port")
+        self.vnc.password = do(parser, self.vnc.section, "password")
+
+        self.groups = config_section(
+            kargs['groups'] if 'groups' in kargs.keys() else self.path,
+            globals()['__CONFIG_SECTION_GROUPS']
+        )
+        parser.read(self.groups.path)
+        self.groups.kvm = do(parser, self.groups.section, "kvm")
+        self.groups.rdp = do(parser, self.groups.section, "rdp")
+        self.groups.vnc = do(parser, self.groups.section, "vnc")
+        self.groups.control = do(parser, self.groups.section, "control")
+
+        self.mysql = config_section(
+            kargs['mysql'] if 'mysql' in kargs.keys() else self.path,
+            globals()['__CONFIG_SECTION_MYSQL']
+        )
+        parser.read(self.mysql.path)
+        self.mysql.host = do(parser, self.mysql.section, "host")
+        self.mysql.port = do(parser, self.mysql.section, "port")
+        self.mysql.user = do(parser, self.mysql.section, "user")
+        self.mysql.passwd = do(parser, self.mysql.section, "passwd")
+        self.mysql.db = do(parser, self.mysql.section, "db")
+
+class mysql:
+
+    def __init__(self, **kargs):
+
+        c = config()
+        self.host = kargs['host'] if 'host' in kargs.keys() else c.mysql.host
+        self.port = kargs['port'] if 'port' in kargs.keys() else c.mysql.port
+        self.user = kargs['user'] if 'user' in kargs.keys() else c.mysql.user
+        self.passwd = kargs['passwd'] if 'passwd' in kargs.keys() else c.mysql.passwd
+        self.db = kargs['db'] if 'db' in kargs.keys() else c.mysql.db
+
+        self.connect()
+
 
     def connect(self, **kargs):
 
-        if 'hostname' in kargs.keys():
-            self.hostname = kargs['hostname']
-
-        if 'password' in kargs.keys():
-            self.password = kargs['password']
-
-        if 'database' in kargs.keys():
-            self.database = kargs['database']
-
+        if 'host' in kargs.keys():
+            self.host = kargs['host']
         if 'port' in kargs.keys():
             self.port = kargs['port']
+        if 'user' in kargs.keys():
+            self.user = kargs['user']
+        if 'passwd' in kargs.keys():
+            self.passwd = kargs['passwd']
+        if 'db' in kargs.keys():
+            self.db = kargs['db']
 
-        try:
-            self.conn = pymysql.connect(
-                host=self.hostname,
-                user=self.username,
-                passwd=self.password,
-                db=self.database,
-                port=self.port)
-        except(
-            mysql.connector.errors.InterfaceError,
-            mysql.connector.errors.ProgrammingError,
-        ) as e:
-            self.error = e
-            self.connection = None
-            sys.exit()
+        # try:
+        self.conn = pymysql.connect(
+            host=self.host,
+            user=self.user,
+            passwd=self.passwd,
+            db=self.db,
+            port=int(self.port))
+        # except :
+        #     # self.error = e
+        #     self.connection = None
+        #     sys.exit()
 
-        self.cursor = self.connection.cursor()
+        self.cursor = self.conn.cursor()
+
+    def columns(self, table):
+        self.sql = "SELECT * FROM {} LIMIT 1".format(table)
+        self.cursor.execute(self.sql)
+        return list(map(
+            lambda x: x[0], self.cursor.description
+        ))
+
+    def tables(self, columns=False):
+        self.sql = "SHOW TABLES"
+        self.cursor.execute(self.sql)
+        self.results = self.cursor.fetchall()
+        if columns:
+            self.results = list(map(
+                lambda x: (
+                    x[0],
+                    self.columns(x[0])
+                ), self.results
+            ))
+        else:
+            self.results = list(map( lambda x: x[0], self.results))
+        return self.results
+
 
     def query(self, sql, params=[], multi=False):
 
@@ -513,7 +598,7 @@ class nmap():
         self.sql, self.sql_param = [], []
 
         if hosts:
-            hosts = re.split('\s+,?\s*|\s*,?\s+', host)
+            hosts = re.split(r'\s+,?\s*|\s*,?\s+', hosts)
             self.sql.append('`host` IN ({})'.format(
                 ', '.join(['?'] * len(hosts))
             ))
@@ -725,7 +810,7 @@ class ldap():
 
         self.conn.search(
             search_base=self.base,
-            search_scope=ldap3.subtree,
+            search_scope=ldap3.SUBTREE,
             search_filter=self.filt,
             attributes=self.attr
         )
@@ -842,11 +927,11 @@ class host():
             if 'dnsHostName' in ldap.keys():
                 self.dnsHostName = ldap['dnshostname'][0]
             if 'distinguishedName' in ldap.keys():
-                self.distinguishedName = ldap['distinguishedname'][0]
+                self.distinguishedName = ldap['distinguishedName'][0]
             if 'operatingSystem' in ldap.keys():
-                self.operatingSystem = ldap['operatingsystem'][0]
+                self.operatingSystem = ldap['operatingSystem'][0]
             if 'operatingSystemVersion' in ldap.keys():
-                self.operatingSystemVersion = ldap['operatingSystemversion'][0]
+                self.operatingSystemVersion = ldap['operatingSystemVersion'][0]
 
     @property
     def nmap(self):
@@ -921,9 +1006,9 @@ class host():
         return self.__dnsHostName
 
     @dnsHostName.setter
-    def dnsHostName(self, dnshostname):
-        self.__dnsHostName = dnshostname
-        if dnsHostName and dnshostname != '':
+    def dnsHostName(self, dnsHostName):
+        self.__dnsHostName = dnsHostName
+        if dnsHostName and dnsHostName != '':
             self.__name = dnsHostName.split('.')[0]
 
     @property
@@ -931,7 +1016,7 @@ class host():
         if self.__operatingSystem:
             return self.__operatingSystem
         if self.__ldap and 'operatingSystem' in self.__ldap.keys():
-            self.operatingSystem = self.__ldap['operatingsystem'][0]
+            self.operatingSystem = self.__ldap['operatingSystem'][0]
 
 
     @operatingSystem.setter
@@ -1079,7 +1164,7 @@ class hosts():
     def hosts(self):
         try:
             self.__hosts
-        except (nameError, attributeError):
+        except (NameError, AttributeError):
             self.__hosts = []
         return self.__hosts
 
@@ -1098,49 +1183,52 @@ class hosts():
             if index:
                 try:
                     self.hosts[index].ldap = host.ldap
-                except (nameError, attributeError):
+                except (NameError, AttributeError):
                     pass
                 try:
                     self.hosts[index].groups = host.groups
-                except (nameError, attributeError):
+                except (NameError, AttributeError):
                     pass
                 try:
                     self.hosts[index].tcp = host.tcp
-                except (nameError, attributeError):
+                except (NameError, AttributeError):
                     pass
                 try:
                     self.hosts[index].nmap = host.nmap
-                except (nameError, attributeError):
+                except (NameError, AttributeError):
                     pass
             else:
                 self.hosts.append(host)
 
-        if hosts:
-            try:
-                self.hosts
-            except (nameError, attributeError):
-                self.hosts = []
 
-            if type(hosts) is list:
-                for host in hosts:
-                    do(host)
-            else:
-                do(hosts)
+        # if items:
+        #     try:
+        #         self.items
+        #     except (NameError, AttributeError):
+        #         self.items = []
+
+        #     if type(items) is list:
+        #         for host in items:
+        #             do(host)
+        #     else:
+        #         do(items)
 
     def scan_ldap(self):
 
         _ldap = ldap()
-        _ldap.filt = '(objectclass=computer)'
+        _ldap.filt = '(objectClass=computer)'
         _ldap_scan = _ldap.scan()
         _nmap_results = []
         _results = []
 
+
         for _d in _ldap_scan:
-            if 'objectclass' in _d['attributes'].keys() and (
-                'computer' in _d['attributes']['objectclass']):
+            if 'objectClass' in _d['attributes'].keys() and (
+                'computer' in _d['attributes']['objectClass']):
+                # print(_d)
                 _c = host()
                 _c.ldap = _d['attributes']
-                _ldap.filt = '''(&(objectclass=group)(member={}))
+                _ldap.filt = '''(&(objectClass=group)(member={}))
                 '''.format(_c.distinguishedName)
                 _ldap.attr = ['cn']
                 _c.groups = list(map(
@@ -1153,7 +1241,7 @@ class hosts():
                         5899: { 'name': 'vnc' } }
                 else:
                     _nmap_results.append(_c.name + '.' + _ldap.fqdn)
-
+                # print(str(_c))
                 _results.append(_c)
                 self.append(_c)
 
@@ -1173,6 +1261,8 @@ class hosts():
 
 
 
-# x =  scan()
+# x =  hosts()
+# # print("***")
 # for y in x.hosts:
 #     print(str(y))
+
