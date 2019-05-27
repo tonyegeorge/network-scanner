@@ -4,3 +4,5 @@ env
 net.db*
 net.cfg*
 .ropeproject*
+tags
+*.log*

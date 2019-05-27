@@ -101,6 +101,9 @@ conn_groups = {
     'vnc/control/server'                               : {'name': '1-server'},
     'vnc/control/workstation'                          : {'name': '2-workstation'},
     'vnc/control/linux'                                : {'name': '3-linux'},
+    'telnet/server'                                    : {'name': '1-server'},
+    'telnet/workstation'                               : {'name': '2-workstation'},
+    'telnet/linux'                                     : {'name': '3-linux'},
 }
 
 guac_db = net.mysql(
@@ -362,11 +365,9 @@ def do_rdp(path, host, port):
             'enable-full-window-drag': 'true',
             'enable-theming': 'true',
             'enable-wallpaper': 'true',
-            'hostname': host.dNSHostName.lower(),
+            'hostname': host.dNSHostName if host.dNSHostName else host.ipv4,
             'ignore-cert': 'true',
             'port': port,
-            'security': 'tls' if host.os and host.version and
-            host.os == 'windows' and int(host.version) > 5 else 'rdp',
         },
         'extra': {
             'path': path.lower(),
@@ -377,6 +378,16 @@ def do_rdp(path, host, port):
                 config['ldap']['user'] not in path))),
         },
     }
+    if host.osFamily and host.osFamily == 'windows' and host.osVersion:
+        try:
+            _v = int(host.osVersion)
+        except:
+            result['parameter']['security'] = 'rdp'
+        else:
+            result['parameter']['security'] = 'tls' if _v > 5 else 'rdp'
+    else:
+        result['parameter']['security'] = 'rdp'
+
     if config['ldap']['user'] in path:
         result['parameter']['username'] = config['ldap']['user']
         result['parameter']['password'] = config['ldap']['password']
@@ -403,7 +414,7 @@ def do_vnc(path, host, port):
         'parent_id': conn_groups[os.path.dirname(path.lower())]['id'],
         'protocol': 'vnc',
         'parameter': {
-            'hostname': host.dNSHostName.lower(),
+            'hostname': host.dNSHostName if host.dNSHostName else host.ipv4,
             'port': port,
             'password': config['vnc']['password'],
             'read-only': 'false' if 'control' in path else 'true',
@@ -431,7 +442,7 @@ def do_ssh(path, host, port):
         'parent_id': conn_groups[os.path.dirname(path.lower())]['id'],
         'protocol': 'ssh',
         'parameter': {
-            'hostname': host.dNSHostName.lower(),
+            'hostname': host.dNSHostName if host.dNSHostName else host.ipv4,
             'port': port,
         },
         'extra': {
@@ -464,9 +475,33 @@ def do_ssh(path, host, port):
 
     return result
 
+def do_telnet(path, host, port):
+    result = {
+        'connection_name': os.path.basename(path),
+        'failover_only': 0,
+        'max_connections': 100,
+        'max_connections_per_user': 100,
+        'parent_id': conn_groups[os.path.dirname(path.lower())]['id'],
+        'protocol': 'telnet',
+        'parameter': {
+            'hostname': host.dNSHostName if host.dNSHostName else host.ipv4,
+            'port': port,
+        },
+        'extra': {
+            'path': path.lower(),
+            'groups': host.groups,
+            'allow': True,
+        },
+    }
+
 def do_hosts():
-    hosts.ldap_scan()
+    hosts.dns_search()
+    hosts.ldap_search()
+    hosts.nmap_scan()
+
     for k,v in hosts.items():
+        if not (v.tcp and (v.name or v.ipv4)):
+            continue
 
         ssh_list = [int(l) for l,w in v.tcp.items()
             if w['name'] == 'ssh' or int(l) == 22]
@@ -477,195 +512,249 @@ def do_hosts():
         tel_list = [int(l) for l,w in v.tcp.items()
             if w['name'] == 'telnet' or int(l) == 23]
 
-        if v.ostype.lower() == 'linux':
-            _user = config['linux']['user']
-        else:
-            _user = config['ldap']['user']
+        if v.osType:
+            if v.osType.lower() == 'linux':
+                _user = config['linux']['user']
+            else:
+                _user = config['ldap']['user']
 
         # rdp
-        cg1 = 'rdp/{}'.format(v.ostype)
-        # cg2 = 'rdp/{}'.format(_user)
-        cg3 = 'rdp/{}/{}'.format(v.ostype, _user)
-        cg4 = 'rdp/{}/{}'.format(_user, v.ostype)
+        if v.osType and v.osType in ('server', 'workstation', 'linux'):
+            cg1 = 'rdp/{}'.format(v.osType)
+            # cg2 = 'rdp/{}'.format(_user)
+            cg3 = 'rdp/{}/{}'.format(v.osType, _user)
+            cg4 = 'rdp/{}/{}'.format(_user, v.osType)
+        else:
+            cg1 = 'rdp'
 
         rp1 = '{}/{}'.format(cg1, v.name)
-        # rp2 = '{}/{}'.format(cg2, v.name)
-        rp3 = '{}/{}'.format(cg3, v.name)
-        rp4 = '{}/{}'.format(cg4, v.name)
+        if v.osType and v.osType in ('server', 'workstation', 'linux'):
+            # rp2 = '{}/{}'.format(cg2, v.name)
+            rp3 = '{}/{}'.format(cg3, v.name)
+            rp4 = '{}/{}'.format(cg4, v.name)
 
         if len(rdp_list) > 1:
 
             conn_groups[rp1] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(rp1)]['id']}
-            # conn_groups[rp2] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(rp2)]['id']}
-            conn_groups[rp3] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(rp3)]['id']}
-            conn_groups[rp4] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(rp4)]['id']}
+            if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                # conn_groups[rp2] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(rp2)]['id']}
+                conn_groups[rp3] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(rp3)]['id']}
+                conn_groups[rp4] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(rp4)]['id']}
 
-            conn_groups[rp1]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[rp1]['parent_id'])
-            # conn_groups[rp2]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[rp2]['parent_id'])
-            conn_groups[rp3]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[rp3]['parent_id'])
-            conn_groups[rp4]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[rp4]['parent_id'])
+                conn_groups[rp1]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[rp1]['parent_id'])
+                # conn_groups[rp2]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[rp2]['parent_id'])
+                conn_groups[rp3]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[rp3]['parent_id'])
+                conn_groups[rp4]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[rp4]['parent_id'])
 
-            cgi1 = do_cg(guac_db.cursor, v.name, conn_groups[cg1]['id'], rp1)
-            # cgi2 = do_cg(guac_db.cursor, v.name, conn_groups[cg2]['id'], rp2)
-            cgi3 = do_cg(guac_db.cursor, v.name, conn_groups[cg3]['id'], rp3)
-            cgi4 = do_cg(guac_db.cursor, v.name, conn_groups[cg4]['id'], rp4)
+                cgi1 = do_cg(guac_db.cursor, v.name, conn_groups[cg1]['id'], rp1)
+                # cgi2 = do_cg(guac_db.cursor, v.name, conn_groups[cg2]['id'], rp2)
+                cgi3 = do_cg(guac_db.cursor, v.name, conn_groups[cg3]['id'], rp3)
+                cgi4 = do_cg(guac_db.cursor, v.name, conn_groups[cg4]['id'], rp4)
 
             for _port in rdp_list:
 
                 rp1 = '{0}/{1}/{1}-{2}'.format(cg1, v.name, _port)
-                # rp2 = '{0}/{1}/{1}-{2}'.format(cg2, v.name, _port)
-                rp3 = '{0}/{1}/{1}-{2}'.format(cg3, v.name, _port)
-                rp4 = '{0}/{1}/{1}-{2}'.format(cg4, v.name, _port)
+                if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                    # rp2 = '{0}/{1}/{1}-{2}'.format(cg2, v.name, _port)
+                    rp3 = '{0}/{1}/{1}-{2}'.format(cg3, v.name, _port)
+                    rp4 = '{0}/{1}/{1}-{2}'.format(cg4, v.name, _port)
 
                 rd1 = do_rdp(rp1, v, rdp_list[0])
-                # rd2 = do_rdp(rp2, v, rdp_list[0])
-                rd3 = do_rdp(rp3, v, rdp_list[0])
-                rd4 = do_rdp(rp4, v, rdp_list[0])
+                if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                    # rd2 = do_rdp(rp2, v, rdp_list[0])
+                    rd3 = do_rdp(rp3, v, rdp_list[0])
+                    rd4 = do_rdp(rp4, v, rdp_list[0])
 
         elif len(rdp_list) > 0:
 
             rd1 = do_rdp(rp1, v, rdp_list[0])
-            # rd2 = do_rdp(rp2, v, rdp_list[0])
-            rd3 = do_rdp(rp3, v, rdp_list[0])
-            rd4 = do_rdp(rp4, v, rdp_list[0])
+            if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                # rd2 = do_rdp(rp2, v, rdp_list[0])
+                rd3 = do_rdp(rp3, v, rdp_list[0])
+                rd4 = do_rdp(rp4, v, rdp_list[0])
 
         # vnc
 
-        cg1 = 'vnc/{}/control'.format(v.ostype)
-        cg2 = 'vnc/{}/monitor'.format(v.ostype)
-        cg3 = 'vnc/control/{}'.format(v.ostype)
-        cg4 = 'vnc/monitor/{}'.format(v.ostype)
+        if v.osType and v.osType in ('server', 'workstation', 'linux'):
+            cg1 = 'vnc/{}/control'.format(v.osType)
+            cg2 = 'vnc/{}/monitor'.format(v.osType)
+            cg3 = 'vnc/control/{}'.format(v.osType)
+            cg4 = 'vnc/monitor/{}'.format(v.osType)
+        else:
+            cg1 = 'vnc'
 
         vp1 = '{}/{}'.format(cg1, v.name)
-        vp2 = '{}/{}'.format(cg2, v.name)
-        vp3 = '{}/{}'.format(cg3, v.name)
-        vp4 = '{}/{}'.format(cg4, v.name)
+        if v.osType and v.osType in ('server', 'workstation', 'linux'):
+            vp2 = '{}/{}'.format(cg2, v.name)
+            vp3 = '{}/{}'.format(cg3, v.name)
+            vp4 = '{}/{}'.format(cg4, v.name)
 
         if len(vnc_list) > 1:
 
             conn_groups[vp1] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(vp1)]['id']}
-            conn_groups[vp2] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(vp2)]['id']}
-            conn_groups[vp3] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(vp3)]['id']}
-            conn_groups[vp4] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(vp4)]['id']}
+            if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                conn_groups[vp2] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(vp2)]['id']}
+                conn_groups[vp3] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(vp3)]['id']}
+                conn_groups[vp4] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(vp4)]['id']}
 
             conn_groups[vp1]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[vp1]['parent_id'])
-            conn_groups[vp2]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[vp2]['parent_id'])
-            conn_groups[vp3]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[vp3]['parent_id'])
-            conn_groups[vp4]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[vp4]['parent_id'])
+            if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                conn_groups[vp2]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[vp2]['parent_id'])
+                conn_groups[vp3]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[vp3]['parent_id'])
+                conn_groups[vp4]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[vp4]['parent_id'])
 
             cgi1 = do_cg(guac_db.cursor, v.name, conn_groups[cg1]['id'], vp1)
-            cgi2 = do_cg(guac_db.cursor, v.name, conn_groups[cg2]['id'], vp2)
-            cgi3 = do_cg(guac_db.cursor, v.name, conn_groups[cg3]['id'], vp3)
-            cgi4 = do_cg(guac_db.cursor, v.name, conn_groups[cg4]['id'], vp4)
+            if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                cgi2 = do_cg(guac_db.cursor, v.name, conn_groups[cg2]['id'], vp2)
+                cgi3 = do_cg(guac_db.cursor, v.name, conn_groups[cg3]['id'], vp3)
+                cgi4 = do_cg(guac_db.cursor, v.name, conn_groups[cg4]['id'], vp4)
 
             for _port in vnc_list:
 
                 vp1 = '{0}/{1}/{1}-{2}'.format(cg1, v.name, _port)
-                vp2 = '{0}/{1}/{1}-{2}'.format(cg2, v.name, _port)
-                vp3 = '{0}/{1}/{1}-{2}'.format(cg3, v.name, _port)
-                vp4 = '{0}/{1}/{1}-{2}'.format(cg4, v.name, _port)
+                if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                    vp2 = '{0}/{1}/{1}-{2}'.format(cg2, v.name, _port)
+                    vp3 = '{0}/{1}/{1}-{2}'.format(cg3, v.name, _port)
+                    vp4 = '{0}/{1}/{1}-{2}'.format(cg4, v.name, _port)
 
                 vd1 = do_vnc(vp1, v, vnc_list[0])
-                vd2 = do_vnc(vp2, v, vnc_list[0])
-                vd3 = do_vnc(vp3, v, vnc_list[0])
-                vd4 = do_vnc(vp4, v, vnc_list[0])
+                if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                    vd2 = do_vnc(vp2, v, vnc_list[0])
+                    vd3 = do_vnc(vp3, v, vnc_list[0])
+                    vd4 = do_vnc(vp4, v, vnc_list[0])
 
         elif len(vnc_list) > 0:
 
             vd1 = do_vnc(vp1, v, vnc_list[0])
-            vd2 = do_vnc(vp2, v, vnc_list[0])
-            vd3 = do_vnc(vp3, v, vnc_list[0])
-            vd4 = do_vnc(vp4, v, vnc_list[0])
+            if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                vd2 = do_vnc(vp2, v, vnc_list[0])
+                vd3 = do_vnc(vp3, v, vnc_list[0])
+                vd4 = do_vnc(vp4, v, vnc_list[0])
 
         # ssh
 
-        cg1 = 'ssh/{}'.format(v.ostype)
-        cg2 = 'ssh/{}/{}'.format(v.ostype, _user)
-        # cg3 = 'ssh/{}'.format(_user)
+        if v.osType and v.osType in ('server', 'workstation', 'linux'):
+            cg1 = 'ssh/{}'.format(v.osType)
+            cg2 = 'ssh/{}/{}'.format(v.osType, _user)
+            # cg3 = 'ssh/{}'.format(_user)
+        else:
+            cg1 = 'ssh'
 
         sp1 = '{}/{}'.format(cg1, v.name)
-        sp2 = '{}/{}'.format(cg2, v.name)
-        # sp3 = '{}/{}'.format(cg3, v.name)
+        if v.osType and v.osType in ('server', 'workstation', 'linux'):
+            sp2 = '{}/{}'.format(cg2, v.name)
+            # sp3 = '{}/{}'.format(cg3, v.name)
 
-        if v.ostype != 'linux':
-            cg4 = 'ssh/{}/{}'.format(_user, v.ostype)
-        else:
-            cg5 = 'ssh/root'
-            cg4 = 'ssh/{}'.format(_user)
-            cg6 = 'ssh/{}/root'.format(v.ostype)
-            cg7 = 'ssh/root'
+        if v.osType and v.osType in ('server', 'workstation', 'linux'):
+            if v.osType != 'linux':
+                cg4 = 'ssh/{}/{}'.format(_user, v.osType)
+            else:
+                cg5 = 'ssh/root'
+                cg4 = 'ssh/{}'.format(_user)
+                cg6 = 'ssh/{}/root'.format(v.osType)
+                cg7 = 'ssh/root'
 
-            sp5 = '{}/{}'.format(cg5, v.name)
-            sp6 = '{}/{}'.format(cg6, v.name)
-            sp7 = '{}/{}'.format(cg7, v.name)
+                sp5 = '{}/{}'.format(cg5, v.name)
+                sp6 = '{}/{}'.format(cg6, v.name)
+                sp7 = '{}/{}'.format(cg7, v.name)
 
-        sp4 = '{}/{}'.format(cg4, v.name)
+            sp4 = '{}/{}'.format(cg4, v.name)
 
         if len(ssh_list) > 1:
 
             conn_groups[sp1] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(sp1)]['id']}
-            conn_groups[sp2] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(sp2)]['id']}
-            # conn_groups[sp3] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(sp3)]['id']}
-            conn_groups[sp4] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(sp4)]['id']}
+            if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                conn_groups[sp2] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(sp2)]['id']}
+                # conn_groups[sp3] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(sp3)]['id']}
+                conn_groups[sp4] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(sp4)]['id']}
 
             conn_groups[sp1]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[sp1]['parent_id'])
-            conn_groups[sp2]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[sp2]['parent_id'])
-            # conn_groups[sp3]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[sp3]['parent_id'])
-            conn_groups[sp4]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[sp4]['parent_id'])
+            if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                conn_groups[sp2]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[sp2]['parent_id'])
+                # conn_groups[sp3]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[sp3]['parent_id'])
+                conn_groups[sp4]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[sp4]['parent_id'])
 
             cgi1 = do_cg(guac_db.cursor, v.name, conn_groups[cg1]['id'], sp1)
-            cgi2 = do_cg(guac_db.cursor, v.name, conn_groups[cg2]['id'], sp2)
-            # cgi3 = do_cg(guac_db.cursor, v.name, conn_groups[cg3]['id'], sp3)
-            cgi4 = do_cg(guac_db.cursor, v.name, conn_groups[cg4]['id'], sp4)
+            if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                cgi2 = do_cg(guac_db.cursor, v.name, conn_groups[cg2]['id'], sp2)
+                # cgi3 = do_cg(guac_db.cursor, v.name, conn_groups[cg3]['id'], sp3)
+                cgi4 = do_cg(guac_db.cursor, v.name, conn_groups[cg4]['id'], sp4)
 
-            if v.ostype == 'linux':
+                if v.osType == 'linux':
 
-                conn_groups[sp5] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(sp5)]['id']}
-                conn_groups[sp6] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(sp6)]['id']}
-                conn_groups[sp7] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(sp7)]['id']}
+                    conn_groups[sp5] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(sp5)]['id']}
+                    conn_groups[sp6] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(sp6)]['id']}
+                    conn_groups[sp7] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(sp7)]['id']}
 
-                conn_groups[sp5]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[sp5]['parent_id'])
-                conn_groups[sp6]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[sp6]['parent_id'])
-                conn_groups[sp7]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[sp7]['parent_id'])
+                    conn_groups[sp5]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[sp5]['parent_id'])
+                    conn_groups[sp6]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[sp6]['parent_id'])
+                    conn_groups[sp7]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[sp7]['parent_id'])
 
-                cgi5 = do_cg(guac_db.cursor, v.name, conn_groups[cg5]['id'], sp5)
-                cgi6 = do_cg(guac_db.cursor, v.name, conn_groups[cg6]['id'], sp6)
-                cgi7 = do_cg(guac_db.cursor, v.name, conn_groups[cg7]['id'], sp7)
+                    cgi5 = do_cg(guac_db.cursor, v.name, conn_groups[cg5]['id'], sp5)
+                    cgi6 = do_cg(guac_db.cursor, v.name, conn_groups[cg6]['id'], sp6)
+                    cgi7 = do_cg(guac_db.cursor, v.name, conn_groups[cg7]['id'], sp7)
 
             for _port in ssh_list:
 
                 sp1 = '{0}/{1}/{1}-{2}'.format(cg1, v.name, _port)
-                sp2 = '{0}/{1}/{1}-{2}'.format(cg2, v.name, _port)
-                # sp3 = '{0}/{1}/{1}-{2}'.format(cg3, v.name, _port)
-                sp4 = '{0}/{1}/{1}-{2}'.format(cg4, v.name, _port)
+                if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                    sp2 = '{0}/{1}/{1}-{2}'.format(cg2, v.name, _port)
+                    # sp3 = '{0}/{1}/{1}-{2}'.format(cg3, v.name, _port)
+                    sp4 = '{0}/{1}/{1}-{2}'.format(cg4, v.name, _port)
 
                 sd1 = do_ssh(sp1, v, ssh_list[0])
+                if v.osType and v.osType in ('server', 'workstation', 'linux'):
+                    sd2 = do_ssh(sp2, v, ssh_list[0])
+                    # sd3 = do_ssh(sp3, v, ssh_list[0])
+                    sd4 = do_ssh(sp4, v, ssh_list[0])
+
+                    if v.osType == 'linux':
+
+                        sp5 = '{0}/{1}/{1}-{2}'.format(cg5, v.name, _port)
+                        sp6 = '{0}/{1}/{1}-{2}'.format(cg6, v.name, _port)
+                        sp7 = '{0}/{1}/{1}-{2}'.format(cg7, v.name, _port)
+
+                        sd5 = do_ssh(sp5, v, ssh_list[0])
+                        sd6 = do_ssh(sp6, v, ssh_list[0])
+                        sd7 = do_ssh(sp7, v, ssh_list[0])
+
+        elif len(ssh_list) > 0:
+
+            sd1 = do_ssh(sp1, v, ssh_list[0])
+            if v.osType and v.osType in ('server', 'workstation', 'linux'):
                 sd2 = do_ssh(sp2, v, ssh_list[0])
                 # sd3 = do_ssh(sp3, v, ssh_list[0])
                 sd4 = do_ssh(sp4, v, ssh_list[0])
 
-                if v.ostype == 'linux':
-
-                    sp5 = '{0}/{1}/{1}-{2}'.format(cg5, v.name, _port)
-                    sp6 = '{0}/{1}/{1}-{2}'.format(cg6, v.name, _port)
-                    sp7 = '{0}/{1}/{1}-{2}'.format(cg7, v.name, _port)
+                if v.osType == 'linux':
 
                     sd5 = do_ssh(sp5, v, ssh_list[0])
                     sd6 = do_ssh(sp6, v, ssh_list[0])
                     sd7 = do_ssh(sp7, v, ssh_list[0])
 
-        elif len(ssh_list) > 0:
+        # telnet
 
-            sd1 = do_ssh(sp1, v, ssh_list[0])
-            sd2 = do_ssh(sp2, v, ssh_list[0])
-            # sd3 = do_ssh(sp3, v, ssh_list[0])
-            sd4 = do_ssh(sp4, v, ssh_list[0])
+        if v.osType and v.osType.lower() in ('windows', 'linux'):
+            cg1 = 'telnet/{}'.format(v.osType)
+        else:
+            cg1 = 'telnet'
 
-            if v.ostype == 'linux':
+        tp1 = '{}/{}'.format(cg1, v.name)
 
-                sd5 = do_ssh(sp5, v, ssh_list[0])
-                sd6 = do_ssh(sp6, v, ssh_list[0])
-                sd7 = do_ssh(sp7, v, ssh_list[0])
+        if len(tel_list) > 1:
+
+            conn_groups[tp1] = {'name': v.name, 'parent_id': conn_groups[os.path.dirname(tp1)]['id']}
+            conn_groups[tp1]['id'] = do_cg(guac_db.cursor, v.name, conn_groups[tp1]['parent_id'])
+            cgi1 = do_cg(guac_db.cursor, v.name, conn_groups[cg1]['id'], tp1)
+
+            for _port in tel_list:
+
+                tp1 = '{0}/{1}/{1}-{2}'.format(cg1, v.name, _port)
+                td1 = do_telnet(tp1, v, tel_list[0])
+
+        elif len(tel_list) > 0:
+
+            td1 = do_telnet(tp1, v, tel_list[0])
 
 DB = net.db()
 hosts = net.hosts(config=config, db=DB)
