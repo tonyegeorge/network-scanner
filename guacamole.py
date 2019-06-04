@@ -1,117 +1,100 @@
-import re
-import warnings
-import os
-import inspect
-import sys
-import net
-import logging
-from pprint import pprint
-from configparser import ConfigParser
 
-this_file = os.path.abspath(
-    inspect.getframeinfo(inspect.currentframe()).filename)
+import net
+from net import getframeinfo, currentframe, sys, os, re, logging
+from net import ConfigParser, mergeConf, mysql, postgres, pprint
+from net import dns_search, ldap_search, nmap_scan, host_object, hosts_dict
+
+this_file = getframeinfo(currentframe()).filename
+this_file = os.path.abspath(this_file)
 this_dir = os.path.dirname(this_file)
+cfg_file = re.sub(r'\.py$', '.cfg', this_file)
+log_file = re.sub(r'\.py$', '.log', this_file)
+
 config = {
-    'path': os.path.join(this_dir, 'net.cfg'),
+    'path': cfg_file,
+    'guacamole': {
+        'url':       'http://localhost:8080/guacamole',
+        'usergroup': 'Users',
+        },
     'db': {
-        'path': os.path.join(this_dir, "net.db"),
-        'init': True,},
-    'nmap': {
-        'days': 7,
-        'ports': '5899-5940,3389,23,22',
-        'arguments': '-O -Pn -R -sV',
-        'arguments_needing_root': '-O -sS',
-        'arguments_port_scan': '-sn -n -PE -PA21-23,80,443,3389,5899-5949',},
-    'ldap': {
-        'days': 3,},
+        'engine':   'mysql',
+        'host':     'localhost',
+        'user':     'guacamole',
+        'password': 'guacamole',
+        'database': 'guacamole_db',
+        },
     'groups': {
         'kvm': 'guacamole_kvm',
         'rdp_allow': 'guacamole_rdp_allow',
         'rdp_deny': 'guacamole_rdp_deny',
         'vnc_deny': 'guacamole_vnc_deny',
         'control_deny': 'guacamole_vnc_deny_control',},
-    'guacamole': {
-        'user_group': 'Users',
-        'db_host': 'localhost',
-        'db_port': 3306,
-        'db_name': 'guacamole_db',},
-    'linux': {
-        'user': None,
-        'password': None,},
-    'vnc': {},
-    'ssh': {
-        'key_file': 'id_rsa',
-        },
     'log': {
         'file': os.path.split(this_file)[0] + '.log',
         'level': logging.DEBUG,
         'format': "%(asctime)s: %(levelname)s: %(message)s",},
     }
-net.parser.read(config['path'])
-net.mergeConf(config, {
-    k: dict(net.parser.items(k))
-    for k in net.parser.sections()
+
+
+parser = ConfigParser()
+parser.read(config['path'])
+mergeConf(config, {
+    k: dict(parser.items(k))
+    for k in parser.sections()
 })
 
 with open(config['ssh']['key_file']) as f0:
     privateKey = f0.read().strip()
 
-conn_groups = {
-    'rdp'                                              : {'name': '1-rdp'},
-    'vnc'                                              : {'name': '2-vnc'},
-    'ssh'                                              : {'name': '3-ssh'},
-    'telnet'                                           : {'name': '4-telnet'},
-    'rdp/server'                                       : {'name': '1-server'},
-    'rdp/workstation'                                  : {'name': '2-workstation'},
-    'rdp/linux'                                        : {'name': '3-linux'},
-    'rdp/{}'.format(config['ldap']['user'])            : {'name': '4-{}'.format(config['ldap']['user'])},
-    'rdp/{}'.format(config['linux']['user'])           : {'name': '5-{}'.format(config['linux']['user'])},
-    'rdp/{}/server'.format(config['ldap']['user'])     : {'name': '1-server'},
-    'rdp/{}/workstation'.format(config['ldap']['user']): {'name': '2-workstation'},
-    'rdp/{}/linux'.format(config['linux']['user'])     : {'name': '1-linux'},
-    'rdp/server/{}'.format(config['ldap']['user'])     : {'name': '1-{}'.format(config['ldap']['user'])},
-    'rdp/workstation/{}'.format(config['ldap']['user']): {'name': '1-{}'.format(config['ldap']['user'])},
-    'rdp/linux/{}'.format(config['linux']['user'])     : {'name': '1-{}'.format(config['linux']['user'])},
-    'ssh/linux'                                        : {'name': '1-linux'},
-    'ssh/server'                                       : {'name': '2-server'},
-    'ssh/workstation'                                  : {'name': '3-workstation'},
-    'ssh/{}'.format(config['ldap']['user'])            : {'name': '4-{}'.format(config['ldap']['user'])},
-    'ssh/root'                                         : {'name': '5-root'},
-    'ssh/{}'.format(config['linux']['user'])           : {'name': '6-{}'.format(config['linux']['user'])},
-    'ssh/server/{}'.format(config['ldap']['user'])     : {'name': '1-{}'.format(config['ldap']['user'])},
-    'ssh/workstation/{}'.format(config['ldap']['user']): {'name': '1-{}'.format(config['ldap']['user'])},
-    'ssh/linux/root'                                   : {'name': '1-root'},
-    'ssh/linux/{}'.format(config['linux']['user'])     : {'name': '2-{}'.format(config['linux']['user'])},
-    'ssh/{}/server'.format(config['ldap']['user'])     : {'name': '1-server'},
-    'ssh/{}/workstation'.format(config['ldap']['user']): {'name': '2-workstation'},
-    'vnc/server'                                       : {'name': '1-server'},
-    'vnc/workstation'                                  : {'name': '2-workstation'},
-    'vnc/linux'                                        : {'name': '3-linux'},
-    'vnc/monitor'                                      : {'name': '4-monitor'},
-    'vnc/control'                                      : {'name': '5-control'},
-    'vnc/server/monitor'                               : {'name': '1-monitor'},
-    'vnc/server/control'                               : {'name': '2-control'},
-    'vnc/workstation/monitor'                          : {'name': '1-monitor'},
-    'vnc/workstation/control'                          : {'name': '2-control'},
-    'vnc/linux/monitor'                                : {'name': '1-monitor'},
-    'vnc/linux/control'                                : {'name': '2-control'},
-    'vnc/monitor/server'                               : {'name': '1-server'},
-    'vnc/monitor/workstation'                          : {'name': '2-workstation'},
-    'vnc/monitor/linux'                                : {'name': '3-linux'},
-    'vnc/control/server'                               : {'name': '1-server'},
-    'vnc/control/workstation'                          : {'name': '2-workstation'},
-    'vnc/control/linux'                                : {'name': '3-linux'},
-    'telnet/server'                                    : {'name': '1-server'},
-    'telnet/workstation'                               : {'name': '2-workstation'},
-    'telnet/linux'                                     : {'name': '3-linux'},
-}
+class db(net.db):
 
-guac_db = net.mysql(
-    host=config['guacamole']['db_host'],
-    port=config['guacamole']['db_port'],
-    user=config['guacamole']['db_user'],
-    passwd=config['guacamole']['db_pass'],
-    db=config['guacamole']['db_name'],)
+    def __init__(self, engine=None, path=None, host=None, port=None,
+        user=None, password=None, database=None, usergroup=None,
+        config_file=globals()['config']['path'],
+        config=globals()['config'],
+        ):
+
+        super().__init__(engine, path, host, port, user, password,
+            database, config_file, config)
+
+
+guac_db = db()
+net_db = net.net_db()
+
+_lu = config['linux']['user']
+_au = config['windows']['user']
+
+conn_groups = {
+    'rdp'                     : {'name': '1-rdp'        },
+    'vnc'                     : {'name': '2-vnc'        },
+    'ssh'                     : {'name': '3-ssh'        },
+    'telnet'                  : {'name': '4-telnet'     },
+    'rdp/server'              : {'name': '1-server'     },
+    'rdp/workstation'         : {'name': '2-workstation'},
+    'rdp/linux'               : {'name': '3-linux'      },
+    'ssh/linux'               : {'name': '1-linux'      },
+    'ssh/server'              : {'name': '2-server'     },
+    'ssh/workstation'         : {'name': '3-workstation'},
+    'vnc/server'              : {'name': '1-server'     },
+    'vnc/linux'               : {'name': '2-linux'      },
+    'vnc/workstation'         : {'name': '3-workstation'},
+    'telnet/server'           : {'name': '1-server'     },
+    'telnet/workstation'      : {'name': '2-workstation'},
+    'telnet/linux'            : {'name': '3-linux'      },
+    'vnc/server/monitor'      : {'name': '1-monitor'    },
+    'vnc/server/control'      : {'name': '2-control'    },
+    'vnc/workstation/monitor' : {'name': '1-monitor'    },
+    'vnc/workstation/control' : {'name': '2-control'    },
+    'vnc/linux/monitor'       : {'name': '1-monitor'    },
+    'vnc/linux/control'       : {'name': '2-control'    },
+    'ssh/linux/root'          : {'name': '1-root'       },
+    'ssh/linux/'       + _lu  : {'name': '2-' + _lu     },
+    'ssh/server/'      + _au  : {'name': '1-' + _au     },
+    'ssh/workstation/' + _au  : {'name': '1-' + _au     },
+    'rdp/server/'      + _au  : {'name': '1-' + _au     },
+    'rdp/workstation/' + _au  : {'name': '1-' + _au     },
+    'rdp/linux/'       + _lu  : {'name': '1-' + _lu     },
+}
 
 def user_group_entity_id(cursor, user_group = 'Users'):
     """Get the entity_id for a specified user_group
@@ -144,13 +127,14 @@ versions
 
 entity_id = user_group_entity_id(guac_db.cursor)
 
-def do_cg(cursor, connection_group_name, parent_id, path = ''):
-    """connection_group(cursor, connection_group_name, parent_id)
-This function returns the connection_group_id of the
-connection_group specified by connection_group_name and
+def do_connection_group(connection_group_name, parent_id,
+    db=guac_db, path = ''):
+    """cg(cursor, cg_name, parent_id)
+This function returns the cg_id of the
+cg specified by cg_name and
 parentt_id, if found it updates it with our default values
 if not found, it creates it and returns the newly created
-connection_group_id"""
+cg_id"""
 
     select_sql = re.sub(r'\s+', ' ', """
     SELECT `connection_group_id` FROM `guacamole_connection_group`
@@ -182,25 +166,30 @@ connection_group_id"""
 
     change = 0
 
-    cursor.execute(select_sql, (connection_group_name, parent_id))
-    row = cursor.fetchone()
+    row = db.get((select_sql, (connection_group_name, parent_id)))
+
+    # cursor.execute(select_sql, (connection_group_name, parent_id))
+    # row = cursor.fetchone()
+
     if row:
         connection_group_id = row[0]
         if cursor.rowcount > 1:
             cursor.execute(delete_sql,
-                (connection_group_name, parent_id, connection_group_id)
-            )
-            if cursor.rowcount > 0: change = 2
+                (connection_group_name, parent_id, connection_group_id))
+            if cursor.rowcount > 0:
+                change = 2
 
-        cursor.execute(update_sql, value_list)
-        if cursor.rowcount > 0: change = 2
+        db.set((update_sql, value_list))
+        if db.cursor.rowcount > 0:
+            change = 2
+
     else:
-        cursor.execute(insert_sql, value_list)
-        connection_group_id = cursor.lastrowid
-        if cursor.rowcount > 0: change = 1
+        db((insert_sql, value_list))
+        connection_group_id = db.cursor.lastrowid
+        if db.cursor.rowcount > 0:
+            change = 1
 
     if entity_id:
-
         upsert_sql = re.sub(r'\s+', ' ', """
         INSERT IGNORE `guacamole_connection_group_permission`
         (`entity_id`, `connection_group_id`, `permission`)
@@ -209,9 +198,10 @@ connection_group_id"""
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            cursor.execute(upsert_sql,
+            db.cursor.execute(upsert_sql,
                 (entity_id, connection_group_id, 'READ'))
-        if cursor.rowcount > 0 and change == 0: change = 2
+        if db.cursor.rowcount > 0 and change == 0:
+            change = 2
     ##############################################
     # log
     if   change == 1: change = 'created'
@@ -229,21 +219,23 @@ def do_cgs():
             if len(k.split('/')) == i):
 
             if i == 1:
-                conn_groups[key]['parent_id'] = do_cg(
-                    guac_db.cursor,
+                conn_groups[key]['parent_id'] = do_connection_group(
                     config['ldap']['fqdn'],
-                    None)
+                    None,
+                    db=guac_db,
+                )
             else:
                 conn_groups[key]['parent_id'] = conn_groups[
-                    re.sub( r'/[^/]*$', '', key)]['id']
+                    os.path.dirname(key)]['id']
 
-            conn_groups[key]['id'] = do_cg(
-                guac_db.cursor,
+            conn_groups[key]['id'] = do_connection_group(
                 conn_groups[key]['name'],
-                conn_groups[key]['parent_id'])
+                conn_groups[key]['parent_id'],
+                db=guac_db,
+            )
 
 
-def do_connection(cursor, connection_dict):
+def do_connection(connection_dicti, db=guac_db):
     """connection(cursor, connection_name, parent_id)
 This function returns the connection_id of the
 connection specified by objCon a python tuple and
@@ -284,11 +276,9 @@ connection_id"""
         ', '.join(('%s',) * len(insert_field_list)),
         ', '.join(['connection_id = LAST_INSERT_ID(connection_id)'] + update_field_list)
     ).replace('\n', ' ')).strip()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        cursor.execute(upsert_sql, (insert_value_list + update_value_list))
-    connection_dict['connection_id'] = cursor.lastrowid
-    conn_change = cursor.rowcount
+    db.set((upsert_sql, (insert_value_list + update_value_list)))
+    connection_dict['connection_id'] = db.cursor.lastrowid
+    conn_change = db.cursor.rowcount
     para_change = 0
     ##############################################
     for ky, vl in para.items():
@@ -299,10 +289,8 @@ connection_id"""
             VALUES (%s, %s, %s) ON DUPLICATE KEY UPDATE `parameter_value` = %s
             """.replace('\n', ' ')).strip()
 
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                cursor.execute(upsert_sql, (connection_dict['connection_id'], ky, vl, vl))
-        if cursor.rowcount > 0: para_change = cursor.rowcount
+            db.set((upsert_sql, (connection_dict['connection_id'], ky, vl, vl)))
+            if db.cursor.rowcount > 0: para_change = db.cursor.rowcount
     ##############################################
     delete_sql = re.sub(r'\s+', ' ', """
     DELETE FROM `guacamole_connection_parameter`
@@ -310,11 +298,9 @@ connection_id"""
     """.format(', '.join(['%s'] * len(delete_field_list))
     ).replace('\n', ' ')).strip()
 
-    cursor.execute(
-        delete_sql,
-        ([connection_dict['connection_id']] + delete_field_list)
-    )
-    if cursor.rowcount > 0: para_change = cursor.rowcount
+    db.set((delete_sql,
+        ([connection_dict['connection_id']] + delete_field_list)))
+    if db.cursor.rowcount > 0: para_change = db.cursor.rowcount
     ##############################################
     if entity_id:
 
@@ -331,11 +317,8 @@ connection_id"""
             AND `connection_id` = %s AND `permission` = %s
             """.replace('\n', ' ')).strip()
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            cursor.execute(sql,
-                (entity_id, connection_dict['connection_id'], 'READ'))
-    if cursor.rowcount > 0: para_change = cursor.rowcount
+        db.set((sql, (entity_id, connection_dict['connection_id'], 'READ')))
+        if db.cursor.rowcount > 0: para_change = db.cursor.rowcount
     ##############################################
     # log
     if   conn_change == 1:                    change = 'created'
@@ -494,10 +477,9 @@ def do_telnet(path, host, port):
         },
     }
 
-def do_hosts():
-    hosts.dns_search()
-    hosts.ldap_search()
-    hosts.nmap_scan()
+
+
+def do_hosts(hosts):
 
     for k,v in hosts.items():
         if not (v.tcp and (v.name or v.ipv4)):
@@ -756,9 +738,10 @@ def do_hosts():
 
             td1 = do_telnet(tp1, v, tel_list[0])
 
-DB = net.db()
-hosts = net.hosts(config=config, db=DB)
-do_cgs()
-do_hosts()
-guac_db.conn.commit()
+hosts = hosts_dict(config=config)
+# do_hosts()
+# hosts = net.hosts(config=config, db=db)
+
+# do_cgs()
+# guac_db.conn.commit()
 
