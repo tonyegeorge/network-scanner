@@ -1,25 +1,17 @@
 
-import IPy as ip
-import copy
-import inspect
-import itertools
 import json
-import jsonpickle
 import ldap3 as ldap
-import logging
-import netifaces
 import nmap
-import os
-import psycopg2 as postgres
-import pymysql as mysql
-import re
-import sqlite3
-import sys
-import warnings
-from collections import OrderedDict
-from configparser import ConfigParser, RawConfigParser, NoSectionError, NoOptionError
+import socket
+import IPy
+import netifaces
+
+import utils
+from utils import *
+
+# from collections import OrderedDict
+# from configparser import ConfigParser, RawConfigParser, NoSectionError, NoOptionError
 from datetime import datetime, timedelta
-from pprint import pprint
 from pypsrp.client import Client
 from textwrap import dedent
 from inspect import currentframe, getframeinfo
@@ -31,13 +23,14 @@ cfg_file = re.sub(r'\.py$', '.cfg', this_file)
 log_file = re.sub(r'\.py$', '.log', this_file)
 db_file = re.sub(r'\.py$', '.db', this_file)
 
+# just doing this so the lines dont exceed 80 columns
 ports  = '22,23,42,53,67,80-88,'
 ports += '135-139,389,443-445,636,'
 ports += '1512,3000,3268,3269,3389,5899-5986,8080'
 
-
-
-config = {
+# Defaults and configuration stored as a dictionary
+# nice for namespace management of settings and globals
+_config = {
     'path': cfg_file,
     'db': {
         'engine': 'sqlite',
@@ -71,6 +64,14 @@ config = {
         'user': None,
         'password': None,
         'key_file': None,
+        'search_scope': ldap.SUBTREE,
+        'search_filter': '(objectClass=computer)',
+        'attributes': ldap.ALL_ATTRIBUTES,
+        'tcp': {
+            22:   {'name': 'ssh'},
+            3389: {'name': 'ms-wbt-server'},
+            5899: {'name': 'vnc'},
+            },
         },
     'log': {
         'file': os.path.split(this_file)[0] + '.log',
@@ -78,763 +79,104 @@ config = {
         'format': "%(asctime)s: %(levelname)s: %(message)s",
         },
     }
+#
+# overide config with values from config file
+# set the database, we dont want to initialize it until its asked for
+# code in db checks if it's initialized before setting it
 
-def mergeConf(dict1, dict2):
-    for k1,v1 in dict2.items():
-        for k2,v2 in v1.items():
-            if v2 is not None:
-                if k1 in dict1.keys():
-                    dict1[k1][k2] = v2
-                else:
-                    dict1[k1] = {k2:v2}
+net_config = get_config(config_dict=_config, config_file=_config['path'])
+net_db = None
+net_hosts = None
 
-def strip0(sql):
-    res = re.sub(r'\s*\n\s*', '\n', sql)
-    res = re.sub(r'^\n', '', res)
-    res = re.sub(r'\n$', '', res).strip()
-    return res
+@bind
+def get_ip(self, d):
+    """
+    This method returns an tuple containing
+    one or more IP address strings that respond
+    as the given domain name
+    """
+    if isinstance(d, (list, tuple)):
+        return {x:self(self,x) for x in d}
+    else:
+        try:
+            data = socket.gethostbyname_ex(d)[2]
+        except:
+            data = []
+        finally:
+            return tuple(data)
 
-def strip1(sql):
-    res = re.sub(r'\s*\n\s*', ' ', sql)
-    res = re.sub(r'\s+', ' ', res).strip()
-    return res
+def get_alias(d):
+    """
+    This method returns an array containing
+    a list of aliases for the given domain
+    """
+    try:
+        data = socket.gethostbyname_ex(d)[1]
+    except Exception:
+        data = []
+    finally:
+        return tuple(data)
 
-parser = ConfigParser()
-parser.read(config['path'])
-mergeConf(config, {
-    k: dict(parser.items(k))
-    for k in parser.sections()
-})
+def get_hostname(ip):
+    """
+    This method returns the 'True Host' name for a
+    given IP address
+    """
+    try:
+        data = socket.gethostbyaddr(ip)[0]
+    except Exception:
+        # fail gracefully
+        data = None
+    finally:
+        return data
 
-def connected_networks():
+def sort_hosts(hosts, **kargs):
+    '''Return a sorted list of ip or ranges got from adding ip
+    specs to IPy.IPSet, IPSet seems to sort its list properly when iterated.
+    hosts
+    The list of hosts can include ip addresses, ip ranges or hostnames.
+    resolve_ip
+    Wether to convert ip ranges into individual ip addresses if true or
+    compress individual ip addressses into ipranges if false, good
+    for the nmap scan
+    discard_names
+    Discard hostnames - not ip addresses
+    resolve_names
+    Resolve hostnames into ip addresses
+    '''
+    resolve_ip = kargs.get('resolve_ip', True)
+    discard_names = kargs.get('discard_names', False)
+    resolve_names = kargs.get('resolve_names', True)
 
-    calc = netifaces.interfaces()
-    calc = [netifaces.ifaddresses(x) for x in calc]
-    calc = [x[netifaces.AF_INET] for x in calc if
-           netifaces.AF_INET in x.keys()]
-    calc = list(itertools.chain.from_iterable(calc))
-    calc = [x for x in calc if
-           not x['addr'].startswith('127.') and 'netmask' in x.keys()]
+    def do_list(_ipset, _recurse=resolve_ip, _result=[]):
+        for _ip in _ipset:
+            if _recurse is False:
+                _result.append(_ip.strNormal())
+            else:
+                do_list(_ip, _recurse=False, _result=_result)
+        return tuple(_result)
 
-    res = ip.IPSet()
-    for cal in calc:
-        res.add(ip.IP(cal['addr'] + '/' + cal['netmask'], make_net=True))
-
-    return res
-
-def sort_hosts(hosts, discard_non_ip=False):
-    if isinstance(hosts, list):
-        hosts = ','.join(hosts)
+    if isinstance(hosts, (list, tuple)): hosts = ','.join(hosts)
     if isinstance(hosts, str):
         hosts = re.sub(r'[\s,]+', ' ', hosts).strip().split()
-        hosti = ip.IPSet()
+        hosti = IPy.IPSet()
         hostd = []
         for host in hosts:
             try:
-                hosti.add(ip.IP(host))
+                hosti.add(IPy.IP(host))
             except:
-                if not discard_non_ip is True:
-                    hostd.append(host)
-        hosts = []
-        for x in hosti:
-            for y in x:
-                hosts.append(y.strNormal())
-        hosts += sorted(hostd)
-        hosts = ' '.join(hosts)
+                if discard_names is not True:
+                    if resolve_names is not True:
+                        hostd.append(host)
+                    else:
+                        for ip in get_ip(host):
+                            hosti.add(IPy.IP(ip))
+        hosts = do_list(hosti)
+        if not discard_names is True:
+            hosts += tuple(sorted(hostd))
     return(hosts)
 
-def sort_ports(ports):
-    if isinstance(ports, list):
-        ports = ','.join(ports)
-    ports = re.sub(r'\n', ' ', ports)
-    ports = re.split(r'[\s,]+', ports)
-    ports = [x.split('-') for x in ports]
-    ports = [[int(x) for x in y] for y in ports]
-    ports.sort()
-    ports = [[str(x) for x in y] for y in ports]
-    ports = ['-'.join(x) for x in ports]
-    ports = ','.join(ports)
-    return ports
-
-def sort_arguments(arguments):
-    if isinstance(arguments, list):
-        arguments = [re.sub(r'^(\s*-\s*)+', '', x) for
-            x in arguments]
-    else:
-        arguments = arguments.split('-')
-    arguments = [x.strip() for x in arguments if x]
-    arguments.sort()
-    arguments = ['-' + x for x in arguments]
-    arguments = ' '.join(arguments)
-    return arguments
-
-class db():
-
-    def __init__(self, engine=None, path=None, host=None, port=None,
-        user=None, password=None, database=None,
-        config_file=None, config=None,):
-
-        if not config:
-            config=globals()['config']['db']
-        if 'db' in config.keys() and isinstance(config['db'], dict):
-            config=config['db']
-
-        if config_file and os.path.isfile(config_file):
-            parser.read(config_file)
-            config.update({k:v for k,v in parser['db'].items() if v})
-
-        self.engine = config.get('engine') if not engine else engine
-        self.path = config.get('path') if not path else path
-        self.host = config.get('host') if not host else host
-        self.port = config.get('port') if not port else port
-        self.user = config.get('user') if not user else user
-        self.password = config.get('password') if not password else password
-        self.database = config.get('database') if not database else database
-
-        if self.engine == 'mysql':
-            self.p = '%s'
-            if not self.port or self.port == '':
-                self.port = 3306
-            else:
-                self.port = int(self.port)
-
-        elif self.engine == 'postgres':
-            self.p = '%s'
-            if not self.port or self.port == '':
-                self.port = 5432
-            else:
-                self.port = int(self.port)
-
-        elif self.engine == 'sqlite':
-            self.p = '?'
-
-        self.sql = None
-        self.data = None
-
-        self.connect()
-
-
-    def connect(self):
-
-        if self.engine == 'mysql':
-            print('connecting to {} {} ...'.format(
-                self.engine, self.database
-            ), end='', flush=True)
-            try:
-                self.connection = mysql.connect(
-                    host=self.host,
-                    port=self.port,
-                    user=self.user,
-                    password=self.password,
-                    database=self.database,
-                )
-            except:
-                print('failed mysql connection error')
-                print(sys.exc_info()[1])
-                self.connection = None
-                sys.exit()
-            else:
-                print('done')
-                self.cursor = self.connection.cursor()
-
-        elif self.engine == 'postgres':
-            print('connecting to {} {} ...'.format(
-                self.engine, self.database
-            ), end='', flush=True)
-            try:
-                self.connection = postgres.connect(
-                    host=self.host,
-                    port=self.port,
-                    user=self.user,
-                    password=self.password,
-                    database=self.database,
-                )
-            except:
-                print('failed postgres connection error')
-                print(sys.exc_info()[1])
-                self.connection = None
-                sys.exit()
-            else:
-                print('done')
-                self.cursor = self.connection.cursor()
-
-        elif self.engine == 'sqlite':
-            print('connecting to {} {} ...'.format(
-                self.engine, self.path
-            ), end='', flush=True)
-            try:
-                self.connection = sqlite3.connect(
-                    self.path,
-                    detect_types=sqlite3.PARSE_DECLTYPES,)
-            except:
-                print('failed sqlite connection error')
-                print(sys.exc_info()[1])
-                self.connection = None
-                sys.exit()
-            else:
-                print('done')
-                self.cursor = self.connection.cursor()
-                self.cursor.execute('PRAGMA journal_mode=wal')
-                self.connection.commit()
-
-    def columns(self, table=None, show=False):
-        if not table:
-            return self.tables(True, show)
-        else:
-            if not isinstance(table, str):
-                return
-        self.cursor.execute('SELECT * FROM {} LIMIT 1'.format(table))
-        self.data = [x[0] for x in self.cursor.description]
-        if show is True:
-            print(table)
-            print('-' * len(table))
-            for r in self.data:
-                print (r)
-        return(self.data)
-
-    def tables(self, columns=False, show=False):
-        if self.engine == 'mysql':
-            self.data = self.get('SHOW TABLES', True)
-        elif self.engine == 'postgres':
-            self.data = self.get(dedent('''\
-            SELECT tablename FROM pg_catalog.pg_tables
-            WHERE schemaname = 'public'
-            '''), True)
-        elif self.engine == 'sqlite':
-            self.data = self.get((dedent('''\
-            SELECT name FROM sqlite_master WHERE type = 'table'
-            ''')), True)
-        self.data = [x[0] for x in self.data]
-        if columns is True:
-            self.data = [(x, self.columns(x)) for x in self.data]
-        if show is True:
-            pprint(self.data)
-        return self.data
-
-    def get(self, sql, all=False, show=False):
-
-        if isinstance(sql, str):
-            self.sql = sql
-            self.cursor.execute(self.sql)
-        elif isinstance(sql, list):
-            self.sql = tuple(sql)
-            self.cursor.execute(*self.sql)
-        elif isinstance(sql, tuple):
-            self.sql = sql
-            self.cursor.execute(*self.sql)
-
-        if all is False:
-            self.data = self.cursor.fetchone()
-        else:
-            self.data = self.cursor.fetchall()
-        if show is True:
-            pprint(self.data)
-        return self.data
-
-    def set(self, sql, commit=True):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-
-            if isinstance(sql, str):
-                self.sql = sql
-                self.cursor.execute(self.sql)
-            elif isinstance(sql, list):
-                self.sql = tuple(sql)
-                self.cursor.execute(*self.sql)
-            elif isinstance(sql, tuple):
-                self.sql = sql
-                self.cursor.execute(*self.sql)
-
-        if not commit is False:
-            self.connection.commit()
-
-class net_db(db):
-    '''
-    ** mysql **
-
-    CREATE DATABASE net_db;
-    CREATE USER 'net_db'@'%' IDENTIFIED WITH mysql_native_password BY 'net_db';
-    CREATE USER 'net_db'@'localhost' IDENTIFIED WITH mysql_native_password BY 'net_db';
-    GRANT ALL PRIVILEGES ON net_db.* TO 'net_db'@'%';
-    GRANT ALL PRIVILEGES ON net_db.* TO 'net_db'@'localhost';
-
-    '''
-    def __init__(self, engine=None, path=None, host=None, port=None,
-        user=None, password=None, database=None, init=None,
-        config_file=globals()['config']['path'],
-        config=None,):
-
-        if not config:
-            config=globals()['config']['db']
-        if 'db' in config.keys() and isinstance(config['db'], dict):
-            config=config['db']
-
-        super().__init__(engine, path, host, port, user, password,
-            database, config_file, config)
-
-        if init is True:
-            self.drop_tables()
-            self.create_tables()
-
-
-    def drop_tables(self):
-        for t in self.tables():
-            print('dropping table {} ...'.format(t), end='', flush=True)
-            self.set('DROP TABLE IF EXISTS ' + t, False)
-            print('done')
-        self.connection.commit()
-
-    def create_tables(self):
-
-        i, u = 'INTEGER PRIMARY KEY', ''
-        if self.engine == 'mysql':
-            i = 'INT PRIMARY KEY AUTO_INCREMENT'
-            u = ' ON UPDATE CURRENT_TIMESTAMP'
-        elif self.engine == 'postgres':
-            i = 'serial PRIMARY KEY'
-
-        print('creating table dns ...', end='', flush=True)
-        self.cursor.execute(dedent('''\
-        CREATE TABLE dns (
-        id {},
-        server VARCHAR(64) NOT NULL,
-        data JSON,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP{}
-        );'''.format(i, u)))
-        print('done')
-        print('creating indexes on dns ...', end='', flush=True)
-        self.cursor.execute('CREATE INDEX dns_server_idx ON dns (server);')
-        self.cursor.execute('CREATE INDEX dns_updated_at_idx ON dns (updated_at);')
-        print('done')
-
-        print('creating table ldap ...', end='', flush=True)
-        self.cursor.execute(dedent('''\
-        CREATE TABLE ldap (
-        id {},
-        server VARCHAR(64) NOT NULL,
-        search_base VARCHAR(255) NOT NULL,
-        search_filter VARCHAR(255) NOT NULL,
-        attributes VARCHAR(255) NOT NULL,
-        data JSON NOT NULL,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP{}
-        );'''.format(i, u)))
-        print('done')
-        print('creating indexes on ldap ...', end='', flush=True)
-        self.cursor.execute('CREATE INDEX ldap_server_idx  ON ldap (server);')
-        self.cursor.execute('CREATE INDEX ldap_search_base_idx  ON ldap (search_base);')
-        self.cursor.execute('CREATE INDEX ldap_search_filter_idx  ON ldap (search_filter);')
-        self.cursor.execute('CREATE INDEX ldap_attributes_idx  ON ldap (attributes);')
-        self.cursor.execute('CREATE INDEX ldap_updated_at_idx  ON ldap (updated_at);')
-        print('done')
-
-        print('creating table nmap ...', end='', flush=True)
-        self.cursor.execute(dedent('''\
-        CREATE TABLE IF NOT EXISTS nmap (
-        id {},
-        host VARCHAR(32) NOT NULL,
-        ports VARCHAR(255) NOT NULL DEFAULT '',
-        arguments VARCHAR(255) NOT NULL DEFAULT '',
-        command_line VARCHAR(255) NOT NULL DEFAULT '',
-        data JSON,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP{}
-        );'''.format(i, u)))
-        print('done')
-        print('creating indexes on nmap ...', end='', flush=True)
-        self.cursor.execute('CREATE INDEX nmap_host_idx  ON nmap (host);')
-        self.cursor.execute('CREATE INDEX nmap_ports_idx  ON nmap (ports);')
-        self.cursor.execute('CREATE INDEX nmap_arguments_idx  ON nmap (arguments);')
-        self.cursor.execute('CREATE INDEX nmap_updated_at_idx  ON nmap (updated_at);')
-        print('done')
-
-        if self.engine == 'postgres':
-            print('creating function set_timestamp ...', end='', flush=True)
-            self.set(dedent('''\
-            CREATE OR REPLACE FUNCTION set_timestamp()
-            RETURNS TRIGGER AS $$
-            BEGIN
-                NEW.updated_at = NOW();
-                RETURN NEW;
-            END;
-            $$ LANGUAGE plpgsql;
-            '''), False)
-            print('done')
-
-        for table in self.tables(columns=True):
-            t = table[0] + '_updated_at'
-
-            if self.engine == 'postgres':
-                print('creating trigger {} ...'.format(t), end='', flush=True)
-                self.set(dedent('''\
-                CREATE TRIGGER {}
-                BEFORE UPDATE ON {}
-                FOR EACH ROW
-                EXECUTE PROCEDURE set_timestamp()
-                '''.format(t, table[0])), False)
-                print('done')
-
-            elif self.engine == 'sqlite':
-                c = ', '.join([x for x in table[1] if x != 'updated_at' ])
-                print('creating trigger {} ...'.format(t), end='', flush=True)
-                self.set(dedent('''\
-                CREATE TRIGGER {0}
-                BEFORE UPDATE OF {1} ON {2}
-                BEGIN
-                    UPDATE {2}
-                    SET updated_at = CURRENT_TIMESTAMP
-                    WHERE id = id;
-                END;
-                '''.format(t, c, table[0])), False)
-                print('done')
-
-        self.connection.commit()
-
-my_db = None
-
-def get_dns(db=None, server=None, days=None, fetchall=False, show=False,
-    config_file=globals()['config']['path'],
-    config=None,
-    ):
-
-    global my_db
-    if not db:
-        if not my_db:
-            my_db = net_db()
-        db = my_db
-
-    if not config:
-        config=globals()['config']['dns']
-    if 'dns' in config.keys() and isinstance(config['dns'], dict):
-        config=config['dns']
-
-    if config_file and os.path.isfile(config_file):
-        parser.read(config_file)
-        config.update({k:v for k,v in parser['dns'].items() if v})
-
-    # server = config.get('server') if not server else server
-    days = config.get('days') if not days else days
-
-    sql = [[],[]]
-
-    if server:
-        if isinstance(server, str):
-            server = re.split(r'[\s,]+', server)
-
-        sql[0].append('server IN ({})'.format(
-            ', '.join([db.p]*len(server))
-        ))
-        sql[1] += server
-
-    if days:
-        sql[0].append('updated_at > ' + db.p)
-        sql[1].append(datetime.now() - timedelta(days=int(days)))
-
-    if sql[0]:
-        sql[0] = 'WHERE ' + ' AND '.join(sql[0])
-    else:
-        sql[0] = ''
-
-    sql[0] = dedent('''\
-    WITH current AS (
-        SELECT * FROM dns
-        {}
-    ), latest AS (
-        SELECT server, MAX(updated_at) AS updated_at
-        FROM current
-        GROUP by server
-    )
-    SELECT current.*
-    FROM current JOIN latest
-    ON current.server = latest.server
-    AND current.updated_at = latest.updated_at
-    ORDER BY current.server, current.updated_at DESC
-    '''.format(sql[0]))
-
-    result = db.get(sql, fetchall)
-    if result:
-        if not server or fetchall is True:
-            if db.engine != 'postgres':
-                result = [
-                    x[:2] + (json.loads(x[2]),) + x[3:] for
-                    x in result ]
-        else:
-            if db.engine != 'postgres':
-                result = result[:2] + (json.loads(result[2]),) + result[3:]
-    if show is True:
-        pprint(result)
-    return result
-
-def set_dns(db=None, server=None, data=None):
-
-    if not data:
-        return
-
-    global my_db
-    if not db:
-        if not my_db:
-            my_db = net_db()
-        db = my_db
-
-    if not server:
-        server = config['dns']['server']
-
-    db.set((dedent('''\
-    INSERT INTO dns (server, data) VALUES ({0},
-    {0}
-    )'''.format(db.p)),
-    (server, json.dumps(data))))
-
-def get_nmap(db=None, hosts=None,
-    ports=None, arguments=None, days=None,
-    fetchall=False, show=False,):
-
-    global my_db
-    if not db:
-        if not my_db:
-            my_db = net_db()
-        db = my_db
-
-    sql = [[],[]]
-
-    if fetchall is False:
-        if not ports:
-            ports = config['nmap']['ports']
-        if not arguments:
-            arguments = config['nmap']['arguments']
-        if not days:
-            days = config['nmap']['days']
-
-    if hosts:
-        hosts = sort_hosts(hosts, True)
-        if isinstance(hosts,str):
-            hosts = hosts.split()
-        sql[0].append('host IN ({})'.format(
-            ', '.join([db.p] * len(hosts))))
-        sql[1] += hosts
-
-    if ports:
-        ports = sort_ports(ports)
-        sql[0].append('ports = ' + db.p)
-        sql[1].append(ports)
-
-    if arguments:
-        arguments = sort_arguments(arguments)
-        sql[0].append('arguments = ' + db.p)
-        sql[1].append(arguments)
-
-    if days:
-        sql[0].append('updated_at > ' + db.p)
-        sql[1].append(datetime.now() - timedelta(days=int(days)))
-
-    if sql[0]:
-        sql[0] = ' WHERE ' + ' AND '.join(sql[0])
-    else:
-        sql[0] = ''
-
-    sql[0] = (dedent('''\
-    WITH current AS (
-    SELECT * FROM nmap{}
-    ), latest AS (
-    SELECT host, MAX(updated_at) AS updated_at
-    FROM current
-    GROUP by host
-    )
-    SELECT * FROM current JOIN latest
-    ON current.host = latest.host
-    AND current.updated_at = latest.updated_at
-    ORDER BY current.host, current.updated_at DESC
-    '''.format(sql[0])))
-
-
-    fetchall = not hosts or fetchall
-    result = db.get(sql, fetchall)
-
-    if result and db.engine != 'postgres':
-        if fetchall is True:
-            result = [ x[:5] + (json.loads(x[5]),) + x[6:] for x in result ]
-        else:
-            result = result[:5] + (json.loads(result[5]),) + result[6:]
-
-    if show is True:
-        pprint(result)
-
-    return result
-
-def set_nmap(db=None,
-    host=None, ports=None, arguments=None,
-    command_line=None, data=None):
-
-    global my_db
-    if not db:
-        if not my_db:
-            my_db = net_db()
-        db = my_db
-
-    if not (host and data):
-        return
-
-    sql = [[], []]
-
-    if host:
-        host = host.strip().lower()
-        sql[0].append('host')
-        sql[1].append(host)
-
-    if ports:
-        ports = sort_ports(ports)
-        sql[0].append('ports')
-        sql[1].append(ports)
-
-    if arguments:
-        arguments = sort_arguments(arguments)
-        sql[0].append('arguments')
-        sql[1].append(arguments)
-
-    if command_line:
-        sql[0].append('command_line')
-        sql[1].append(command_line)
-
-    sql[0].append('data')
-    sql[1].append(json.dumps(data))
-
-    sql[0] = dedent('''\
-    INSERT INTO nmap ({})
-    VALUES ({})
-    '''.format(
-        ', '.join(sql[0]),
-        ', '.join([db.p] * len(sql[0]))
-    ))
-    db.set(sql)
-
-
-def get_ldap(db=None, server=None, search_base=None, search_filter=None,
-    attributes=None, days=None, show=False, fetchall=False):
-
-    global my_db
-    if not db:
-        if not my_db:
-            my_db = net_db()
-        db = my_db
-
-    sql = [[],[]]
-
-    if all is False:
-        if not server:
-            server = config['ldap']['server']
-        if not search_base:
-            search_base = config['ldap']['search_base']
-        if not search_filter:
-            search_filter = config['ldap']['search_filter']
-        if not attributes:
-            attributes = ldap.ALL_ATTRIBUTES
-        if not days:
-            days = config['ldap']['days']
-
-    if server:
-        if isinstance(server, str):
-            server = re.split(r'[\s,]+', server)
-
-        sql[0].append('server IN ({})'.format(
-            ', '.join([db.p]*len(server))
-        ))
-        sql[1] += server
-
-    if search_base:
-        sql[0].append('search_base = ' + db.p)
-        sql[1].append(search_base)
-
-    if search_filter:
-        sql[0].append('search_filter = ' + db.p)
-        sql[1].append(search_filter)
-
-    if attributes:
-        sql[0].append('attributes = ' + db.p)
-        sql[1].append(json.dumps(attributes))
-
-    if days:
-        sql[0].append('updated_at > ' + db.p)
-        sql[1].append(datetime.now() - timedelta(days=int(days)))
-
-    if sql[0]:
-        sql[0] = 'WHERE ' + ' AND '.join(sql[0])
-    else:
-        sql[0] = ''
-
-    sql[0] = dedent('''\
-    WITH current AS (
-        SELECT * FROM ldap
-        {}
-    ), latest AS (
-        SELECT server, MAX(updated_at) AS updated_at
-        FROM current
-        GROUP by server
-    )
-    SELECT current.*
-    FROM current JOIN latest
-    ON current.server = latest.server
-    AND current.updated_at = latest.updated_at
-    ORDER BY current.server, current.updated_at DESC
-    '''.format(sql[0]))
-
-    fetchall = not server or fetchall is True
-    result = db.get(sql, fetchall)
-
-    if result and db.engine != 'postgres':
-        if fetchall is True:
-            result = [ x[:5] + (json.loads(x[5]),) + x[6:] for x in result ]
-        else:
-            result = result[:5] + (json.loads(result[5]),) + result[6:]
-
-    if show is True:
-        pprint(result)
-
-    return result
-
-
-def set_ldap(db=None, server=None,
-    search_base=None, search_filter=None, attributes=None,
-    data=None):
-
-    global my_db
-    if not db:
-        if not my_db:
-            my_db = net_db()
-        db = my_db
-
-    if not (server and data and (
-        search_base or search_filter or attributes)):
-        return
-
-    sql = [[], []]
-
-    sql[0].append('server')
-    sql[1].append(server)
-
-    if search_base:
-        sql[0].append('search_base')
-        sql[1].append(search_base)
-
-    if search_filter:
-        sql[0].append('search_filter')
-        sql[1].append(search_filter)
-
-    if attributes:
-        sql[0].append('attributes')
-        sql[1].append(json.dumps(attributes))
-
-    sql[0].append('data')
-    sql[1].append(json.dumps(data))
-
-    sql[0] = dedent('''\
-    INSERT INTO ldap ({})
-    VALUES ({})
-    '''.format(
-        ', '.join(sql[0]),
-        ', '.join([db.p] * len(sql[0]))
-    ))
-
-    db.set(sql)
-
-class host_object():
+class host():
 
     def __init__(self,
         build = None,
@@ -855,60 +197,59 @@ class host_object():
         osVersion = None,
         tcp = {},
     ):
-
-        self.__build = build
-        self.__dNSDomainName = dNSDomainName
-        self.__dNSHostName = dNSHostName
-        self.__dNSHostNames = dNSHostNames
-        self.__fqhn = fqhn
-        self.__groups = groups
-        self.__ipv4 = ipv4
-        self.__ldap = ldap
-        self.__name = name
-        self.__names = names
-        self.__nmap = nmap
-        self.__operatingSystem = operatingSystem
-        self.__operatingSystemVersion = operatingSystemVersion
-        self.__osFamily = osFamily
-        self.__osType = osType
-        self.__osVersion = osVersion
-        self.__tcp = tcp
+        self._build = build
+        self._dNSDomainName = dNSDomainName
+        self._dNSHostName = dNSHostName
+        self._dNSHostNames = dNSHostNames
+        self._fqhn = fqhn
+        self._groups = groups
+        self._ipv4 = ipv4
+        self._ldap = ldap
+        self._name = name
+        self._names = names
+        self._nmap = nmap
+        self._operatingSystem = operatingSystem
+        self._operatingSystemVersion = operatingSystemVersion
+        self._osFamily = osFamily
+        self._osType = osType
+        self._osVersion = osVersion
+        self._tcp = tcp
 
     @property
     def build(self):
-        return self.__build
+        return self._build
 
     @build.setter
     def build(self, val):
-        self.__build = val
+        self._build = val
 
     @property
     def dNSDomainName(self):
-        return self.__dNSDomainName
+        return self._dNSDomainName
 
     @dNSDomainName.setter
     def dNSDomainName(self, val):
-        self.__dNSDomainName = val.lower()
+        self._dNSDomainName = val.lower()
 
     @property
     def dNSHostName(self):
-        return self.__dNSHostName
+        return self._dNSHostName
 
     @dNSHostName.setter
     def dNSHostName(self, val):
-        self.__dNSHostName = val.lower()
+        self._dNSHostName = val.lower()
 
     @property
     def dNSHostNames(self):
-        return self.__dNSHostNames
+        return self._dNSHostNames
 
     @dNSHostNames.setter
     def dNSHostNames(self, val):
-        self.__dNSHostNames = val
+        self._dNSHostNames = val
 
     @property
     def fqhn(self):
-        return self.__fqhn
+        return self._fqhn
 
     @fqhn.setter
     def fqhn(self, val):
@@ -916,41 +257,41 @@ class host_object():
             val = re.split(r'[\s,]+', val)
         elif isinstance(val, dict):
             val = [x['name'] for x in val if 'name' in val.keys()]
-        self.__fqhn = sorted(list(
-            set(self.__fqhn).union(
+        self._fqhn = sorted(list(
+            set(self._fqhn).union(
             set([x.lower() for x in val]))
         ))
 
     @property
     def groups(self):
-        return self.__groups
+        return self._groups
 
     @groups.setter
     def groups(self, val):
-        self.__groups = val
+        self._groups = val
 
     @property
     def ipv4(self):
-        return self.__ipv4
+        return self._ipv4
 
     @ipv4.setter
     def ipv4(self, val):
-        self.__ipv4 = val
+        self._ipv4 = val
 
     @property
     def ldap(self):
 
-        return self.__ldap
+        return self._ldap
 
     @ldap.setter
     def ldap(self, val):
-        self.__ldap = val
-        if 'dNSHostName' in self.__ldap.keys() and self.__ldap['dNSHostName'] and not self.dNSHostName:
-            self.dNSHostName = self.__ldap['dNSHostName'][0]
-        if 'operatingSystem' in self.__ldap.keys() and self.__ldap['operatingSystem']:
-            self.operatingSystem = self.__ldap['operatingSystem'][0]
-        if 'operatingSystemVersion' in self.__ldap.keys() and self.__ldap['operatingSystemVersion']:
-            self.operatingSystemVersion = self.__ldap['operatingSystemVersion'][0]
+        self._ldap = val
+        if 'dNSHostName' in self._ldap.keys() and self._ldap['dNSHostName'] and not self.dNSHostName:
+            self.dNSHostName = self._ldap['dNSHostName'][0]
+        if 'operatingSystem' in self._ldap.keys() and self._ldap['operatingSystem']:
+            self.operatingSystem = self._ldap['operatingSystem'][0]
+        if 'operatingSystemVersion' in self._ldap.keys() and self._ldap['operatingSystemVersion']:
+            self.operatingSystemVersion = self._ldap['operatingSystemVersion'][0]
         if self.dNSHostName and self.osFamily == 'windows':
             self.tcp = {
                 22: { 'name': 'ssh' },
@@ -961,33 +302,33 @@ class host_object():
 
     @property
     def name(self):
-        return self.__name
+        return self._name
 
     @name.setter
     def name(self, val):
-        self.__name = val.lower()
+        self._name = val.lower()
 
     @property
     def names(self):
-        return self.__names
+        return self._names
 
     @names.setter
     def names(self, val):
-        self.__names = val
+        self._names = val
 
     @property
     def nmap(self):
-        return self.__nmap
+        return self._nmap
 
     @nmap.setter
     def nmap(self, val):
-        self.__nmap = val
+        self._nmap = val
         # pprint(val)
         # wait = input("PRESS ENTER TO CONTINUE.")
-        if not self.__nmap[1]['scan']:
+        if not self._nmap[1]['scan']:
             return
 
-        _nm = self.__nmap[1]['scan'][self.__nmap[0]]
+        _nm = self._nmap[1]['scan'][self._nmap[0]]
 
         if 'hostnames' in _nm.keys():
             _hn = [x['name'].lower() for x in _nm['hostnames']]
@@ -1045,11 +386,11 @@ class host_object():
 
     @property
     def operatingSystem(self):
-        return self.__operatingSystem
+        return self._operatingSystem
 
     @operatingSystem.setter
     def operatingSystem(self, operatingSystem):
-        self.__operatingSystem = operatingSystem
+        self._operatingSystem = operatingSystem
         if operatingSystem:
             if 'windows' in operatingSystem.lower():
                 self.osFamily = 'windows'
@@ -1063,34 +404,34 @@ class host_object():
 
     @property
     def operatingSystemVersion(self):
-        return self.__operatingSystemVersion
+        return self._operatingSystemVersion
 
     @operatingSystemVersion.setter
     def operatingSystemVersion(self, ver):
-        self.__operatingSystemVersion = ver
+        self._operatingSystemVersion = ver
         if ver:
             self.version = int(re.sub(r'^([0-9]+).*$', r'\1', ver))
             self.build = int(re.sub(r'^.*\(([0-9]*)\).*$', r'\1', ver))
 
     @property
     def osFamily(self):
-        return self.__osFamily
+        return self._osFamily
 
     @osFamily.setter
     def osFamily(self, val):
-        self.__osFamily = val.lower()
+        self._osFamily = val.lower()
 
     @property
     def osType(self):
-        return self.__osType
+        return self._osType
 
     @osType.setter
     def osType(self, val):
-        self.__osType = val.lower()
+        self._osType = val.lower()
 
     @property
     def osVersion(self):
-        return self.__osVersion
+        return self._osVersion
 
     @osVersion.setter
     def osVersion(self, val):
@@ -1099,67 +440,640 @@ class host_object():
                 x = float(val)
             except:
                 if 'xp' in val.lower():
-                    self.__osVersion = 5.2
+                    self._osVersion = 5.2
                 elif 'vista' in val.lower():
-                    self.__osVersion = 6.0
+                    self._osVersion = 6.0
                 else:
-                    self.__osVersion = val
+                    self._osVersion = val
             else:
                 if x == 2003:
-                    self.__osVersion = 5.2
+                    self._osVersion = 5.2
                 elif x == 2003:
-                    self.__osVersion = 5.2
+                    self._osVersion = 5.2
                 elif x == 7 or x == 2008:
-                    self.__osVersion = 6.1
+                    self._osVersion = 6.1
                 elif x == 8:
-                    self.__osVersion = 6.2
+                    self._osVersion = 6.2
                 elif x == 2012:
-                    self.__osVersion = 6.3
+                    self._osVersion = 6.3
                 else:
-                    self.__osVersion = val
+                    self._osVersion = val
         else:
-            self.__osVersion = val
-
+            self._osVersion = val
 
     @property
     def tcp(self):
-        return self.__tcp
+        return self._tcp
 
     @tcp.setter
     def tcp(self, val):
-        mergeConf(self.__tcp, val)
+        for k,v in val.items():
+            self._tcp[k] = self._tcp.get(k, v)
 
-def dns_search(server=None, domain=None, user=None, password=None,
-    days=None, db=None, host_dict={},
-    config_file=config['path'],
-    config=None,
-    ):
 
-    global my_db
-    if not db:
-        if not my_db:
-            my_db = net_db()
-        db = my_db
+class network(utils._db):
+    """The network object which has as it's core a database of scan results
+    from dns, ldap and nmap
+    """
+    def __init__(self, **a):
+        self.config = get_config(
+            config_dict=a.get("config", net_config),
+            config_file=a.get("config_file", net_config.get("path", None))
+        )
+        c = self.config.get("db", {})
+        c["network"] = a.get("network", c.get("network", ""))
+        c["engine"] = a.get("engine", c.get("engine", "sqlite"))
+        c["path"] = a.get("path", c.get("path", None))
+        c["host"] = a.get("host", c.get("host", None))
+        c["port"] = a.get("port", c.get("port", None))
+        c["user"] = a.get("user", c.get("user", None))
+        c["password"] = a.get("password", c.get("password", None))
+        c["database"] = a.get("database", c.get("database", "net_db"))
+        c["init"] = a.get("init", c.get("init", False))
+        super().__init__(
+            engine=c["engine"],
+            path=c["path"],
+            host=c["host"],
+            port=c["port"],
+            user=c["user"],
+            password=c["password"],
+            database=c["database"],
+        )
+        self.decode_json = c["engine"] != "postgres"
+        if c["init"] is True:
+            self.drop_tables()
+        self.create_tables()
+        self.hosts = self.get_hosts()
+    #
+    def create_tables(self, print_log=True):
+        engine = self.config.get("db", {}).get("engine", "sqlite")
+        def create_updated_at_trigger(table, commit=True):
+            nonlocal engine
+            if not table or engine == "mysql": return
+            t = table + "_updated_at"
+            col = "  " + ",\n  ".join(
+                [x for x in self.columns(table) if x != "updated_at"]
+            )
+            if engine == "postgres":
+                # print("creating trigger {} ...".format(t), end="", flush=True)
+                self.set("DROP TRIGGER IF EXISTS {} ON {}".format(t, table))
+                self.set("""
+                CREATE TRIGGER {}
+                BEFORE UPDATE OF
+                {}
+                ON {}
+                FOR EACH ROW EXECUTE PROCEDURE set_timestamp()
+                """.format(t, col, table), False)
+                # print("done")
+            elif engine == "sqlite":
+                # print("creating trigger {} ...".format(t), end="", flush=True)
+                self.set("DROP TRIGGER IF EXISTS {}".format(t))
+                self.set("""
+                CREATE TRIGGER {0}
+                BEFORE UPDATE OF
+                {1}
+                ON {2}
+                BEGIN
+                    UPDATE {2}
+                    SET updated_at = CURRENT_TIMESTAMP
+                    WHERE id = id;
+                END;
+                """.format(t, col, table), False)
+                # print("done")
+        if engine == "postgres":
+            # print("creating function set_timestamp ...", end="", flush=True)
+            self.set(dedent("""
+            CREATE OR REPLACE FUNCTION set_timestamp()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                NEW.updated_at = NOW();
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            """), False)
+            # print("done")
+        #
+        i, u = "INTEGER PRIMARY KEY", ""
+        if engine == "mysql":
+            i = "INT PRIMARY KEY AUTO_INCREMENT"
+            u = " ON UPDATE CURRENT_TIMESTAMP"
+        elif engine == "postgres":
+            i = "serial PRIMARY KEY"
+        #
+        table = "network"
+        sql = """
+        CREATE TABLE {} (
+            id {},
+            name VARCHAR(64) NOT NULL DEFAULT '',
+            config JSON,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP{},
+            UNIQUE (name)
+        ); """.format("{0}",i, u)
+        res = self.create_table(table, sql, commit=False, print_log=print_log)
+        create_updated_at_trigger(table, commit=False)
+        #
+        table = "host"
+        sql = """
+        CREATE TABLE {} (
+            id {},
+            network_id INTEGER,
+            name VARCHAR(64),
+            data JSON,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP{},
+            UNIQUE (network_id, name),
+            FOREIGN KEY (network_id) REFERENCES network(id)
+                ON DELETE CASCADE
+        ); """.format("{0}", i, u)
+        res = self.create_table(table, sql, commit=False, print_log=print_log)
+        create_updated_at_trigger(table, commit=False)
+        #
+        table = "dns"
+        sql = """
+        CREATE TABLE {} (
+            id {},
+            network_id INTEGER,
+            server VARCHAR(64) NOT NULL,
+            data JSON,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP{},
+            FOREIGN KEY (network_id) REFERENCES network(id)
+                ON DELETE CASCADE
+        );""".format("{0}", i, u)
+        res = self.create_table(table, sql, commit=False, print_log=print_log)
+        create_updated_at_trigger(table, commit=False)
+        #
+        table = "ldap"
+        sql = """
+        CREATE TABLE {} (
+            id {},
+            network_id INTEGER,
+            server VARCHAR(64) NOT NULL,
+            search_base VARCHAR(255) NOT NULL,
+            search_filter VARCHAR(255) NOT NULL,
+            attributes VARCHAR(255) NOT NULL,
+            data JSON NOT NULL,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP{},
+            FOREIGN KEY (network_id) REFERENCES network(id)
+                ON DELETE CASCADE
+        ); """.format("{0}", i, u)
+        res = self.create_table(table, sql, commit=False, print_log=print_log)
+        create_updated_at_trigger(table, commit=False)
+        #
+        table = "nmap"
+        sql = """
+        CREATE TABLE {} (
+            id {},
+            network_id INTEGER,
+            host VARCHAR(64) NOT NULL,
+            ports VARCHAR(255) NOT NULL DEFAULT '',
+            arguments VARCHAR(255) NOT NULL DEFAULT '',
+            command_line VARCHAR(255) NOT NULL DEFAULT '',
+            data JSON NOT NULL,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP{},
+            FOREIGN KEY (network_id) REFERENCES network(id)
+                ON DELETE CASCADE
+        );""".format("{0}", i, u)
+        res = self.create_table(table, sql, commit=False, print_log=print_log)
+        create_updated_at_trigger(table, commit=False)
+        #
+        self.connection.commit()
 
-    if not config:
-        config=globals()['config']['dns']
-    if 'dns' in config.keys() and isinstance(config['dns'], dict):
-        config=config['dns']
+    @staticmethod
+    def sort_nmap_ports(ports):
+        if isinstance(ports, list):
+            ports = ','.join(ports)
+        ports = re.sub(r'\n', ' ', ports)
+        ports = re.split(r'[\s,]+', ports)
+        ports = [x.split('-') for x in ports]
+        ports = [[int(x) for x in y] for y in ports]
+        ports.sort()
+        ports = [[str(x) for x in y] for y in ports]
+        ports = ['-'.join(x) for x in ports]
+        ports = ','.join(ports)
+        return ports
 
-    if config_file and os.path.isfile(config_file):
-        parser.read(config_file)
-        config.update({k:v for k,v in parser['dns'].items() if v})
+    @staticmethod
+    def sort_nmap_arguments(arguments):
+        if isinstance(arguments, list):
+            arguments = [re.sub(r"^(\s*-\s*)+", "", x) for x in arguments]
+        else: arguments = arguments.split("-")
+        arguments = [x.strip() for x in arguments if x]
+        arguments.sort()
+        arguments = ["-" + x for x in arguments]
+        arguments = " ".join(arguments)
+        return arguments
 
-    server = config.get('server') if not server else server
-    domain = config.get('domain') if not domain else domain
-    user = config.get('user') if not user else user
-    password = config.get('password') if not password else password
-    days = config.get('days') if not days else days
-    if domain:
-        username = domain + '\\' + user
-    else:
-        username = user
+    def get_table(self, table, **kargs):
+        """Generic select statement for known tables
 
+        if a field column named data is included in the select, then it
+        is assumed to be json encoded and decoded if neccessary
+        postgres 11 does not require decoding maybe previous versions do
+
+        The table must have a field called updated_at, if current is True,
+        then only return records that have been updated in the last number
+        of days given by the days parameter
+
+        if fetchall is True it returns all records in a list of tuples
+        if fetchall is False it returns a single record as a tuple
+        the default for fetchall is False
+
+        criteria is an optional dict of {column: value} to be used in the
+        where clause of the select statement, if any of the values is a list
+        or tuple, then a 'WHERE column IN ()' is used if not a
+        'WHERE column =' is used
+
+        columns is an optional list of columns for the select statement
+        can be a comma or space separated string or a list or tuple of
+        strings if not specified, '*' (all columns) is assumed
+        """
+        config = self.config.get(table, {})
+        fetchall = kargs.get("fetchall", False)
+        show = kargs.get("show", False)
+        current = kargs.get("current", True)
+        columns = kargs.get("columns", "*")
+        criteria = kargs.get("criteria", {})
+        defaults = kargs.get("defaults", ())
+        days = kargs.get("days", None) or config.get("days", None)
+        if fetchall is False:
+            for i in defaults:
+                criteria[i] = kargs.get(i, None) or config.get(i, None)
+        else:
+            for i in defaults:
+                criteria[i] = kargs.get(i, None)
+        network = config.get("network", None)
+        # pprint(criteria)
+        if isinstance(columns, str):
+            columns = re.split(r"[\s,]+", columns)
+        columns = ["n.name" if x == "network" else "t." + x for x in columns]
+        columns = ", ".join(columns)
+        sql = [
+            ["n.name {} {}".format("=" if network else "IS", self.p)],
+            [network]
+        ]
+        if days and current is True:
+            sql[0].append("t.updated_at > " + self.p)
+            sql[1].append(datetime.now() - timedelta(days=int(days)))
+        if criteria:
+            for k,v in criteria.items():
+                if v:
+                    if isinstance(v, list) or isinstance(v, tuple):
+                        sql[0].append("{} IN ({})".format(
+                            "t." + k, ", ".join([self.p] * len(v))))
+                        if isinstance(v, tuple):
+                            sql[1] += list(v)
+                        else:
+                            sql[1] += v
+                    else:
+                        sql[0].append("{} = {}".format("t." + k, self.p))
+                        sql[1].append(v)
+        if sql[0]:
+            sql[0] = " WHERE " + " AND ".join(sql[0])
+        else:
+            sql[0] = ""
+
+        sql[0] = """
+        SELECT {}
+        FROM {} AS t
+        JOIN network AS n ON t.network_id = n.id
+        {}
+        ORDER BY t.updated_at DESC
+        {};""".format(
+            columns, table, sql[0],
+            "LIMIT 1" if not fetchall is True else "",
+        )
+        r = self.get(sql=sql, fetchall=fetchall, show=show)
+        c = [x[0] for x in self.cursor.description]
+        if self.decode_json is False: return r
+        def d(t, c):
+            r = ()
+            for x in range(len(t)):
+                if c[x] in ("data","config"): r += (json.loads(t[x]),)
+                else: r += (t[x],)
+            return r
+        if not r:
+            return r
+        if fetchall == True:
+            return [d(x, c) for x in r]
+        else:
+            return d(r, c)
+
+    def encode_ldap_attributes(self, s):
+        if isinstance(s, str):
+            return json.dumps([s])
+        elif isinstance(s, (list, tuple)):
+            return json.dumps(list(s))
+
+    def decode_ldap_attributes(self, s):
+            return json.loads(s)
+
+    def get_network(self, network=None, commit=True):
+        c = self.config.get("db", {})
+        network = network or c.get("network", None)
+        engine = c.get("engine", None)
+        self.cursor.execute(
+            "SELECT * FROM network WHERE name = {}".format(self.p),
+            (network,)
+        )
+        result = self.cursor.fetchone()
+        if not result:
+            self.cursor.execute("""
+            INSERT INTO network (name, config) VALUES ({0}, {0}){1}
+            """.format(
+                self.p,
+                " RETURNING *" if self.engine == "postgres" else "",
+            ), (
+                network,
+                json.dumps(self.config),
+            ))
+            if engine == "postgres":
+                result = self.cursor.fetchone()
+                if commit is not False: self.connection.commit()
+            else:
+                if commit is not False: self.connection.commit()
+                result = self.get_network()
+        return result
+
+    def set_network(self, network=None, commit=True):
+        c = self.config.get("db", {})
+        network = network or c.get("network", None)
+        self.cursor.execute(
+            "SELECT * FROM network WHERE name = {}".format(self.p),
+            (network,)
+        )
+        result = self.cursor.fetchone()
+        if not result:
+            self.cursor.execute("""
+            INSERT INTO network (name, config) VALUES ({0}, {0})
+            """.format(self.p,), (
+                network,
+                json.dumps(self.config),
+            ))
+        else:
+            self.cursor.execute("""
+            UPDATE network SET name = {0}, config = {0} WHERE id = {0}
+            """.format(self.p,), (
+                network,
+                json.dumps(self.config),
+                result[0]
+            ))
+        if commit is not False: self.connection.commit()
+
+    def get_hosts(self):
+        """Read host objects stored in the database as serialized json
+        into a dict of host objects
+        """
+        def dto(h):
+            """Convert a dict to a new host object
+            """
+            r = host()
+            for k, v in h.items(): setattr(r, k, v)
+            return r
+            #
+        r = self.get_table("host", columns="name, data",
+                           fetchall=True, current=False,)
+        return {x[0]: dto(x[1]) for x in r} if r else {}
+
+    def get_dns(self, **a):
+        a["table"] = "dns"
+        config = self.config.get(a["table"], None)
+        a["network"] = a.get("network", config.get("network", None))
+        a["server"] = a.get("server", config.get("server", None))
+        a["days"] = a.get("days", config.get("days", None))
+        a["defaults"] = ("server",)
+        return self.get_table(**a)
+
+    def get_ldap(self, **a):
+        a["table"] = "ldap"
+        config = self.config.get(a["table"], None)
+        a["network"] = a.get("network", config.get("network", None))
+        a["days"] = a.get("days", config.get("days", None))
+        a["columns"] = a.get("columns", None)
+        a["criteria"] = {
+            "server": a.get("server", config.get("server", None)),
+            "search_base": a.get("search_base", config.get("search_base", None)),
+            "search_filter": a.get("search_filter", config.get("search_filter", None)),
+            "attributes": a.get("attributes", config.get("attributes", None)),
+        }
+        return self.get_table(**a)
+
+    def get_nmap(self, **a):
+        a["table"] = "nmap"
+        config = self.config.get(a["table"], None)
+        a["network"] = a.get("network", config.get("network", None))
+        a["days"] = a.get("days", config.get("days", None))
+        a["columns"] = a.get("columns", None)
+        a["criteria"] = {
+            "hosts": a.get("hosts", config.get("ip_range", None)),
+            "ports": a.get("ports", config.get("ports", None)),
+            "arguments": a.get("arguments", config.get("arguments", None)),
+        }
+        return self.get_table(**a)
+    #
+    def set_hosts(self, hosts=None):
+        """
+        hosts is a dictionary of type
+        { string: object }
+        """
+        conf = self.config("db", {})
+        hosts = hosts or self.hosts
+        hosts = {k: json.dumps(v.__dict__) for k, v in hosts.items()}
+        if not hosts:
+            return
+        names = [k for k, v in hosts.items()]
+        if conf.get("engine", None) == "mysql":
+            d = "ON DUPLICATE KEY UPDATE"
+        else:
+            d = "ON CONFLICT (network_id, name) DO UPDATE SET"
+        network_id = self.get_network(commit=False)[0]
+        for k, v in hosts.items():
+            sql = ("""
+                INSERT INTO host (network_id, name, data)
+                VALUES ({0}, {0}, {0})
+                {1}
+                data = {0}""".format(self.p, d), (network_id, k, v, v)
+            )
+            self.set(sql, commit=False)
+        sql = ("""
+            DELETE FROM host WHERE network_id = {}
+            AND name NOT IN ({})
+            """.format(self.p, ', '.join([self.p] * len(names))),
+            (network_id,) + tuple(names)
+        )
+        self.set(sql, commit=False)
+        self.connection.commit()
+
+    def set_dns(self, **k):
+        conf = self.config("dns", {})
+        server = k.get("server", conf.get("server", None))
+        network = k.get("network", conf.get("network", None))
+        network_id = self.get_network(network=network, commit=False)[0]
+        data = k.get("data", None)
+        if not data:
+            return
+        sql = ("""
+            INSERT INTO dns (network_id, server, data)
+            VALUES ({0}, {0}, {0})""".format(self.p),
+            (network_id, server, json.dumps(data)))
+        self.set(sql, commit=False)
+        self.connection.commit()
+
+    def set_nmap(self, host=None, ports=None, arguments=None,
+                            command_line=None, data=None, **kargs):
+        section = "nmap"
+        config = get_config(section,
+            config_dict=kargs.get("config", net_config.get(section, {})),
+            config_file=kargs.get("config_file", net_config.get("path", None)))
+        if not (host and data): return
+        network_id = self.get_network(commit=False)
+        sql = [["network_id"], [network_id]]
+        if host:
+            host = host.strip().lower()
+            sql[0].append("host")
+            sql[1].append(host)
+        if ports:
+            ports = self.sort_nmap_ports(ports)
+            sql[0].append("ports")
+            sql[1].append(ports)
+        if arguments:
+            arguments = self.sort_nmap_arguments(arguments)
+            sql[0].append("arguments")
+            sql[1].append(arguments)
+        if command_line:
+            sql[0].append("command_line")
+            sql[1].append(command_line)
+        sql[0].append("data")
+        sql[1].append(json.dumps(data))
+        sql[0] = "INSERT INTO {} ({}) VALUES ({});".format(
+            section, ", ".join(sql[0]), ", ".join([self.p] * len(sql[0])))
+        self.set(sql, commit=False)
+        self.connection.commit()
+
+
+    def set_ldap(self, **kargs,):
+        section = "ldap"
+        config = get_config(
+            config_section=section,
+            config_dict=kargs.get("config", net_config.get(section, {})),
+            config_file=kargs.get("config_file", net_config.get("path", None))
+        )
+        def get_var(v,d=None):
+            return kargs.get(v, None) or config.get(v, d)
+        network = get_var("network")
+        server = get_var("server")
+        search_base = get_var("search_base")
+        search_filter = get_var("search_filter")
+        attributes = get_var("attributes")
+        data = get_var("data")
+        commit = get_var("commit")
+        if not (server and data and (
+            search_base or search_filter or attributes)):
+            return
+        network_id = self.get_network(commit=False)[0]
+        sql = [["network_id"], [network_id]]
+        sql[0].append("server")
+        sql[1].append(server)
+        if search_base:
+            sql[0].append("search_base")
+            sql[1].append(search_base)
+        if search_filter:
+            sql[0].append("search_filter")
+            sql[1].append(search_filter)
+        if attributes:
+            sql[0].append("attributes")
+            sql[1].append(self.encode_ldap_attributes(attributes))
+        sql[0].append("data")
+        sql[1].append(json.dumps(data))
+        sql[0] = "INSERT INTO {} ({}) VALUES ({});".format(
+            section, ", ".join(sql[0]), ", ".join([self.p] * len(sql[0])))
+        # pprint(sql[1][:-1])
+        self.set(sql, commit=False)
+        self.connection.commit()
+
+
+def host_list(*args):
+    hostd = []
+    hosti = ip.IPSet()
+    for arg in args:
+        ar = arg
+        if isinstance(ar, str):
+            ar = re.sub(r'\n', ' ', ar)
+            ar = re.split(r'[\s,]+', ar)
+        for a in ar:
+            try:
+                hosti.add(ip.IP(a))
+            except:
+                hostd.append(a)
+
+    res = [x.strNormal() for x in hosti] + sorted(hostd)
+    res = ' '.join(res)
+    return (hosti.len() + len(hostd), res)
+
+
+def combine_hosts(*args):
+    hostd = []
+    hosti = ip.IPSet()
+    for arg in args:
+        ar = arg
+        if isinstance(ar, str):
+            ar = re.sub(r'\n', ' ', ar)
+            ar = re.split(r'[\s,]+', ar)
+        for a in ar:
+            try:
+                hosti.add(ip.IP(a))
+            except:
+                hostd.append(a)
+    res = [x.strNormal() for x in hosti] + sorted(hostd)
+    res = ' '.join(res)
+    return res
+
+
+def connected_networks():
+
+    calc = netifaces.interfaces()
+    calc = [netifaces.ifaddresses(x) for x in calc]
+    calc = [x[netifaces.AF_INET] for x in calc if
+           netifaces.AF_INET in x.keys()]
+    calc = list(itertools.chain.from_iterable(calc))
+    calc = [x for x in calc if
+           not x['addr'].startswith('127.') and 'netmask' in x.keys()]
+
+    res = ip.IPSet()
+    for cal in calc:
+        res.add(ip.IP(cal['addr'] + '/' + cal['netmask'], make_net=True))
+
+    res = [x.strNormal() for x in res]
+    res = ' '.join(res)
+
+    return res
+
+
+def json_hosts_dict(hosts_dict):
+    result = {k:v.__dict__ for k,v in hosts_dict.items()}
+    return result
+
+
+
+def dns_search(**kargs):
+    global net_db
+    global net_hosts
+    global net_config
+    config = get_config(
+        config_section="dns",
+        config_dict=kargs.get("config", net_config),
+        config_file=kargs.get("config_file", net_config.get("path", None)),
+    )
+    def get_var(v,d=None):
+        return kargs.get(v, None) or config.get(v, d)
+    server = get_var("server")
+    domain = get_var("domain")
+    user = get_var("user")
+    password = get_var("password")
+    days = get_var("days")
+    network = get_var("network")
+    save_hosts = get_var("save_hosts", True)
+    username = domain + '\\' + user if domain else user
+    db = kargs.get('db', None) or _db(set_hosts=True, db=net_db)
+    hostsd = kargs.get('hostsd', net_hosts)
     def search():
         dns_client = Client(server, username=username, password=password,
             ssl=False)
@@ -1173,80 +1087,106 @@ def dns_search(server=None, domain=None, user=None, password=None,
             Select-Object IPv4Address, HostName, @{l="Zone";e={$Zone.ZoneName}}
         }
         """
-        stdout, stderr, rc = dns_client.execute_ps(ps)
+        try:
+            stdout, stderr, rc = dns_client.execute_ps(ps)
+        except Exception as e:
+            print('failed')
+            print(e)
+            # print(sys.exc_info()[1])
+            # print(stderr)
+            return [], e
         res = [x.split() for x in stdout.split('\n') if x][2:]
         res = sorted([[x[0], (x[1] + '.' + x[2]).lower()] for x in res])
         res = itertools.groupby(res, lambda x: x[0])
         res = [[k,[x[1] for x in list(v)]] for k,v in res]
-        res = [[ip.IP(x[0]).int(), x[0], x[1]] for x in res]
+        res = [[IPy.IP(x[0]).int(), x[0], x[1]] for x in res]
         res = [x[1:] for x in sorted(res)]
-        return res
-
-    res = get_dns(db=db, server=server, days=days)
-
+        return res, None
+    #
+    res = db.get_dns(server=server, columns=("data"), days=days)
     if res:
-        print('read cached dns {}'.format(server))
-        res = res[2]
+        print("read cached dns {}".format(server))
+        res = res[0]
     else:
-        print('searching dns {} ...'.format(server),
-              end='', flush=True)
+        print("searching dns {} ...".format(server), end="", flush=True)
         res = search()
-        print('done')
-        print('saving dns search {} ...'.format(server), end='', flush=True)
-        set_dns(db, server, res)
-        print('done')
-
+        if res[1]:
+            print("failed")
+            res = db.get_dns(server=server, columns=("data"))
+            if res:
+                print("could not query server {} read cached".format(server))
+                res = res[0]
+            else:
+                print("could not query server {}".format(server))
+                res = None
+        else:
+            print("done")
+            res = res[0]
+        if res:
+            print("saving dns search {} ..."
+                  .format(server), end="", flush=True)
+            db.set_dns(server, res)
+            print("done")
+    # print(res)
     for s in res:
         f = None
-
         for n in s[1]:
-            if n in host_dict.keys():
+            if n in hostsd.keys():
                 f = n
                 break
             if not f:
-                for k,v in host_dict.items():
+                for k,v in hostsd.items():
                     if n in v.fqhn:
                         f = k
                         break
         if not f:
             f = sorted(s[1])[0]
-            host_dict[f] = host_object()
-        host_dict[f].ipv4 = s[0]
-        host_dict[f].fqhn = s[1]
+            hostsd[f] = host()
+        hostsd[f].ipv4 = s[0]
+        hostsd[f].fqhn = s[1]
+    if save_hosts is True:
+        db.set_hosts(hostsd)
 
-    return host_dict
+def ldap_search(**k):
+    global net_db
+    global net_hosts
+    global net_config
+    config = get_config(
+        config_section="ldap",
+        config_dict=k.get("config", None) or net_config,
+        config_file=k.get("config_file", None) or net_config.get("path", None),
+    )
+    def get_var(v):
+        return k.get(v, None) or config.get(v, None)
+    server = get_var("server")
+    fqdn = get_var("fqdn")
+    domain = get_var("domain")
+    user = get_var("user")
+    password = get_var("password")
+    days = get_var("days")
+    network = get_var("network")
+    search_scope = get_var("search_scope")
+    search_filter = get_var("search_filter")
+    attributes = get_var("attributes")
+    save_hosts = get_var("save_hosts")
 
-def ldap_search(server=None, fqdn=None, domain=None,
-    user=None, password=None, days=None,
-    config_file=config['path'], config=None,
-    db=None, host_dict={},
-    ):
+    username = domain + "\\" + user if domain else user
+    db = k.get("db", net_db) or _db(set_hosts=True, db=net_db)
+    hostsd = k.get("hostsd", net_hosts)
+    search_base = ",".join(["dc=" + x for x in fqdn.split(".")])
 
-    global my_db
-    if not db:
-        if not my_db:
-            my_db = net_db()
-        db = my_db
+    # pprint(config)
+    # pprint(server)
+    # pprint(search_base)
+    # pprint(search_filter)
+    # pprint(search_scope)
+    # pprint(type(attributes))
 
-    if not config:
-        config=globals()['config']['ldap']
-    if 'ldap' in config.keys() and isinstance(config['ldap'], dict):
-        config=config['ldap']
+    # return
 
-    if config_file and os.path.isfile(config_file):
-        parser.read(config_file)
-        config.update({k:v for k,v in parser['ldap'].items() if v})
-
-    server = config.get('server') if not server else server
-    fqdn = config.get('fqdn') if not fqdn else fqdn
-    domain = config.get('domain') if not domain else domain
-    user = config.get('user') if not user else user
-    password = config.get('password') if not password else password
-    days = config.get('days') if not days else days
-    search_scope = ldap.SUBTREE
-    search_filter ='(objectClass=computer)'
-    attributes = ldap.ALL_ATTRIBUTES
-    search_base = ','.join(['dc=' + x for x in fqdn.split('.')])
+    # search_scope = ldap.SUBTREE
+    # search_filter ='(objectClass=computer)'
+    # attributes = ldap.ALL_ATTRIBUTES
 
     conn = None
 
@@ -1255,65 +1195,87 @@ def ldap_search(server=None, fqdn=None, domain=None,
         search_base=search_base,
         search_filter=search_filter,
         attributes=attributes,
-        days=days,
-    ):
-        nonlocal conn
+        days=days,):
 
-        res = get_ldap(db=db,
+        args = locals()
+        nonlocal conn
+        res = db.get_ldap(
             server=server,
             search_base=search_base,
             search_filter=search_filter,
             attributes=attributes,
-            days=days,
-        )
-
+            columns=("data",),
+            days=days,)
         if res:
-            print('read cached ldap {} {}'.format(server, search_filter))
-            res = res[5]
-            return res
+            print("read cached ldap {} {}".format(server, search_filter))
+            res = res[0]
         else:
             if not conn:
                 try:
-                    print('connecting to ldap server {} ...'.format(server),
-                          end='', flush=True)
+                    print("connecting to ldap server {} ...".format(server),
+                          end="", flush=True)
                     conn = ldap.Connection(
-                        server='ldap://' + server,
-                        user=domain + '\\' + user,
+                        server="ldap://" + server,
+                        user=username,
                         password=password,
                         authentication=ldap.NTLM,
                         auto_bind=True,
                     )
-                    print('done')
-                except:
-                    print(sys.exc_info()[1])
-                    return []
-
-            print('search ldap {} {} ...'.format(server, search_filter),
-                end='', flush=True)
-            conn.search(
-                search_base=search_base,
-                search_scope=search_scope,
-                search_filter=search_filter,
-                attributes=attributes,
-            )
-            print('done')
-
-            # beacause of a couple of datetime fields in the output
-            # we have to use the ldap3 lib to convert the entry to json
-            # then use json lib to bring it back to dict
-            res = [json.loads(x.entry_to_json()) for x in conn.entries]
-
-            print('saving ldap {} {} ...'.format(server, search_filter),
-                end='', flush=True)
-            set_ldap(db=db,
-                server=server,
-                search_base=search_base,
-                search_filter=search_filter,
-                attributes=attributes,
-                data=res
-            )
-            print('done')
+                    print("done")
+                except Exception as e:
+                    print("failed")
+                    print(e)
+                    res = [], e
+            if conn:
+                print("search ldap {} {} ...".format(server, search_filter),
+                end="", flush=True)
+                try:
+                    conn.search(
+                        search_base=search_base,
+                        search_scope=search_scope,
+                        search_filter=search_filter,
+                        attributes=attributes,
+                    )
+                except Exception as e:
+                    print("failed")
+                    print(e)
+                    res = [], e
+                # beacause of a couple of datetime fields in the output
+                # we have to use the ldap3 lib to convert the entry to json
+                # then use json lib to bring it back to dict
+                res = [json.loads(x.entry_to_json()) for x in conn.entries], None
+            if res[1]:
+                print("failed")
+                res = db.get_ldap(
+                    server=server,
+                    search_base=search_base,
+                    search_filter=search_filter,
+                    attributes=attributes,
+                    columns=("data",),
+                )
+                if res:
+                    print("could not query server {} read cached".format(server))
+                    res = res[0]
+                else:
+                    print("could not query server {}".format(server))
+                    res = None
+            else:
+                print("done")
+                res = res[0]
+            if res:
+                print("saving ldap {} {} ...".format(server, search_filter),
+                    end="", flush=True)
+                db.set_ldap(
+                    server=server,
+                    search_base=search_base,
+                    search_filter=search_filter,
+                    attributes=attributes,
+                    data=res
+                )
+                print("done")
         return res
+
+    # pprint(attributes)
 
     groups = search(search_filter='(objectClass=group)', attributes=['name', 'member'])
     groups = [[x['attributes']['name'][0], x['attributes']['member'],] for x in groups]
@@ -1324,274 +1286,270 @@ def ldap_search(server=None, fqdn=None, domain=None,
             n = s['attributes']['name'][0]
             n = (n + '.' + fqdn).lower()
             f = None
-            if n in host_dict.keys():
+            if n in hostsd.keys():
                 f = n
             else:
-                for k,v in host_dict.items():
+                for k,v in hostsd.items():
                     for x in v.fqhn:
                         if n == x:
-                            host_dict[n] = host_dict[k]
+                            hostsd[n] = hostsd[k]
                             f = n
                             break
                     if f:
-                        del host_dict[k]
+                        del hostsd[k]
                         break
             if not f:
                 f = n
-                host_dict[f] = host_object()
-            host_dict[f].ldap = s['attributes']
-            host_dict[f].groups = [x[0] for
+                hostsd[f] = host()
+            hostsd[f].ldap = s['attributes']
+            hostsd[f].groups = [x[0] for
             x in groups if s['attributes']['distinguishedName'][0] in x[1]]
 
-    return host_dict
-
-
-def nmap_scan(hosts=None, fqdn=None, ip_range=None, days=None,
-    ports=None, arguments=None,
-    config_file=config['path'], config=None,
-    network=False, db=my_db, host_dict={},
-    ):
-
-    global my_db
-    if not db:
-        if not my_db:
-            my_db = net_db()
-        db = my_db
-
-    if not config:
-        config=globals()['config']['nmap']
-    if 'nmap' in config.keys() and isinstance(config['nmap'], dict):
-        config=config['nmap']
-
-    if config_file and os.path.isfile(config_file):
-        parser.read(config_file)
-        config.update({k:v for k,v in parser['nmap'].items() if v})
-
-    fqdn = config.get('fqdn') if not fqdn else fqdn
-    ip_range = config.get('ip_range') if not ip_range else ip_range
-    days = config.get('days') if not days else days
-    ports = config.get('ports') if not ports else ports
-    arguments = config.get('arguments') if not arguments else arguments
-
-    output = {}
-
-    def set_dict(ip, result):
-        if 'scan' not in result.keys():
-            return
-        f = None
-        for k,v in host_dict.items():
-            if v.ipv4 and v.ipv4 == ip:
-                f = k
-                break
-        if not f:
-            s = result['scan'][ip]
-            if 'hostnames' in s.keys():
-                for h in s['hostnames']:
-                    if h['name'] in host_dict.keys():
-                        f = h['name']
-                        break
-                if not f:
-                    f = s['hostnames'][0]['name']
-                    host_dict[f] = host_object()
-        if not f:
-            f = ip
-            host_dict[f] = host_object()
-        host_dict[f].nmap = [ip, result]
-        output[f] = host_dict[f]
-
-    def save_entry(ip, result):
-        if not result['scan']:
-            return
-        if db:
-            cmd = result['nmap']['command_line']
-            set_nmap(db=db,
-                host=ip, ports=ports, arguments=arguments,
-                command_line=cmd, data=[ip, result])
-            print('\nsaved  : {}'.format(cmd))
-        set_dict(ip, result)
-
-    def hosts_append(ip, result):
-        nonlocal hosts
-        hosts.append(ip)
-
-
-    def ipset_add(ipset, addr):
-        try:
-            ipset.add(addr)
-        except:
-            pass
-
-    if not hosts:
-        hosts = [v.ipv4 for k,v in host_dict.items() if v.ipv4]
-        hosts += (sorted([k for k,v in host_dict.items() if not v.ipv4]))
-        hosts = ' '.join(hosts)
-    if network is True:
-        hosts = hosts + ' ' + ip_range
-
-    hosts = sort_hosts(hosts)
-    if hosts == '':
-        return
-
-    print('nmap scan ....')
-    ps = nmap.PortScanner()
-    psa = nmap.PortScannerAsync()
-
-    l = len(hosts.split())
-    print('ping {} ....'.format(
-        hosts if l < 2 else 'sweep ' + str(l) + ' hosts'
-    ), end='', flush=True)
-    # ps.scan(hosts, arguments='-n -sn -PE -PA22,23,80', sudo=True)
-    ps.scan(hosts, arguments=config['ping'], sudo=True)
-    hosts = ps.all_hosts()
-    l = len(hosts)
-    ls = '1 host' if l == 1 else str(l) + ' hosts'
-    print('done. Found {}'.format(ls))
-    print('searching database for {} ...'.format(ls), end='', flush=True)
-    results = get_nmap(db=db,
-        hosts=hosts,
-        ports=ports,
-        arguments=arguments,
-        fetchall=True,
-        days=days,
-    )
-    l = len(results)
-    ls = '1 host' if l == 1 else str(l) + ' hosts'
-    print('done. Found {}'.format(ls))
-
-    if results:
-        hostd = [x[1] for x in results]
-        hosts = [x for x in hosts if x not in hostd]
-        for result in results:
-            if not result[5][1]['scan']:
-                hosts.append(result[0])
-                continue
-            print('read   : {}'.format(result[4]))
-            set_dict(result[5][0], result[5][1])
-
-    hosts = sort_hosts(hosts)
-    ports = sort_ports(ports)
-    arguments = sort_arguments(arguments)
-
-    if hosts:
-        psa = nmap.PortScannerAsync()
-        l = len(hosts.split())
-        ls = '1 host' if l == 1 else str(l) + ' hosts'
-        print('scanning {}'.format(ls))
-        print("Waiting for nmap ....")
-        psa.scan(
-            hosts=hosts,
-            ports=ports,
-            arguments=arguments,
-            callback=save_entry,
-            sudo=True,
-            )
-        while psa.still_scanning():
-            print('.', end='', flush=True)
-            psa.wait(10)
-
-    print('nmap scan done')
-    return host_dict
-
-
-def hosts_dict(
-    arguments=None,
-    days=None,
-    domain=None,
-    fqdn=None,
-    hosts=None,
-    ip_range=None,
-    password=None,
-    ports=None,
-    server=None,
-    user=None,
-    dns_days=None,
-    dns_domain=None,
-    dns_password=None,
-    dns_server=None,
-    dns_user=None,
-    ldap_days=None,
-    ldap_domain=None,
-    ldap_fqdn=None,
-    ldap_password=None,
-    ldap_server=None,
-    ldap_user=None,
-    nmap_arguments=None,
-    nmap_days=None,
-    nmap_fqdn=None,
-    nmap_hosts=None,
-    nmap_ip_range=None,
-    nmap_ports=None,
-    config_file=config['path'], config={},
-    db=None, host_dict={},
-    ):
-
-    global my_db
-    if not db:
-        if not my_db:
-            my_db = net_db()
-        db = my_db
-
-    if not config:
-        config=globals()['config']
-
-    if config_file and os.path.isfile(config_file):
-        parser.read(config_file)
-        mergeConf(config, {
-            k: dict(parser.items(k))
-            for k in parser.sections()
-        })
-
-    if not dns_server: dns_server = server if server else config.get('dns', {}).get('server', None)
-    if not dns_user: dns_user = user if user else config.get('dns', {}).get('user', None)
-    if not dns_domain: dns_domain = domain if domain else config.get('dns', {}).get('domain', None)
-    if not dns_password: dns_password = password if password else config.get('dns', {}).get('password', None)
-    if not dns_days: dns_days = days if days else config.get('dns', {}).get('days', None)
-
-    if not ldap_server: ldap_server = server if server else config.get('ldap', {}).get('server', None)
-    if not ldap_fqdn: ldap_fqdn = fqdn if fqdn else config.get('ldap', {}).get('fqdn', None)
-    if not ldap_user: ldap_user = user if user else config.get('ldap', {}).get('user', None)
-    if not ldap_domain: ldap_domain = domain if domain else config.get('ldap', {}).get('domain', None)
-    if not ldap_password: ldap_password = password if password else config.get('ldap', {}).get('password', None)
-    if not ldap_days: ldap_days = days if days else config.get('ldap', {}).get('days', None)
-
-    if not nmap_hosts: nmap_hosts = hosts if hosts else config.get('nmap', {}).get('hosts', None)
-    if not nmap_fqdn: nmap_fqdn = fqdn if fqdn else config.get('nmap', {}).get('fqdn', None)
-    if not nmap_ip_range: nmap_ip_range = ip_range if ip_range else config.get('nmap', {}).get('ip_range', None)
-    if not nmap_days: nmap_days = days if days else config.get('nmap', {}).get('days', None)
-    if not nmap_ports: nmap_ports = ports if ports else config.get('nmap', {}).get('ports', None)
-    if not nmap_arguments: nmap_arguments = arguments if arguments else config.get('nmap', {}).get('arguments', None)
-
-    dns_search(
-        server=dns_server,
-        user=dns_user,
-        domain=dns_domain,
-        password=dns_password,
-        days=dns_days,
-        db=db,
-        host_dict=host_dict,
-    )
-
-    ldap_search(
-        server=ldap_server,
-        fqdn=ldap_fqdn,
-        domain=ldap_domain,
-        user=ldap_user,
-        password=ldap_password,
-        days=ldap_days,
-        db=db,
-        host_dict=host_dict,
-    )
-
-    nmap_scan(
-        hosts=nmap_hosts,
-        fqdn=nmap_fqdn,
-        ip_range=nmap_ip_range,
-        days=nmap_days,
-        ports=nmap_ports,
-        arguments=nmap_arguments,
-        db=db,
-        host_dict=host_dict,
-    )
-
-    return host_dict
-
+#    return hostsd
+#
+#
+#def nmap_scan(hosts=None, fqdn=None, ip_range=None, days=None,
+#    ports=None, arguments=None,
+#    config_file=config['path'], config=None,
+#    db=net_db, host_dict={},
+#    scan_connected=False, scan_ip_range=False,
+#    ):
+#
+#    global net_db
+#    if not db:
+#        if not net_db:
+#            net_db = db()
+#        db = net_db
+#
+#    if not config:
+#        config=globals()['config']['nmap']
+#    if 'nmap' in config.keys() and isinstance(config['nmap'], dict):
+#        config=config['nmap']
+#
+#    if config_file and os.path.isfile(config_file):
+#        parser.read(config_file)
+#        config.update({k:v for k,v in parser['nmap'].items() if v})
+#
+#    if not hosts:
+#        hosts = combine_hosts(
+#            [v.ipv4 if v.ipv4 else k for k,v in host_dict.items()]
+#        )
+#    if scan_connected is True:
+#        hosts = combine_hosts(hosts, connected_networks())
+#    if scan_ip_range is True:
+#        hosts = combine_hosts(hosts, ip_range)
+#
+#    if not hosts or hosts == '':
+#        return
+#
+#    fqdn = config.get('fqdn') if not fqdn else fqdn
+#    ip_range = config.get('ip_range') if not ip_range else ip_range
+#    days = config.get('days') if not days else days
+#    ports = config.get('ports') if not ports else ports
+#    arguments = config.get('arguments') if not arguments else arguments
+#
+#    output = {}
+#
+#    def set_dict(ip, result):
+#        if 'scan' not in result.keys():
+#            return
+#        f = None
+#        for k,v in host_dict.items():
+#            if v.ipv4 and v.ipv4 == ip:
+#                f = k
+#                break
+#        if not f:
+#            s = result['scan'][ip]
+#            if 'hostnames' in s.keys():
+#                for h in s['hostnames']:
+#                    if h['name'] in host_dict.keys():
+#                        f = h['name']
+#                        break
+#                if not f:
+#                    f = s['hostnames'][0]['name']
+#                    host_dict[f] = host()
+#        if not f:
+#            f = ip
+#            host_dict[f] = host()
+#        host_dict[f].nmap = [ip, result]
+#        output[f] = host_dict[f]
+#
+#    def save_entry(ip, result):
+#        if not result['scan']:
+#            return
+#        if db:
+#            cmd = result['nmap']['command_line']
+#            set_nmap(db=db,
+#                host=ip, ports=ports, arguments=arguments,
+#                command_line=cmd, data=[ip, result])
+#            print('\nsaved  : {}'.format(cmd))
+#        set_dict(ip, result)
+#
+#
+#    print('nmap scan ....')
+#    ps = nmap.PortScanner()
+#    psa = nmap.PortScannerAsync()
+#
+#    l, hosts = host_list(hosts)
+#    print('ping {} ....'.format(
+#        hosts if l < 2 else 'sweep ' + str(l) + ' hosts'
+#    ), end='', flush=True)
+#    # ps.scan(hosts, arguments='-n -sn -PE -PA22,23,80', sudo=True)
+#    ps.scan(hosts, arguments=config['ping'], sudo=True)
+#    hosts = ps.all_hosts()
+#    l = len(hosts)
+#    ls = '1 host' if l == 1 else str(l) + ' hosts'
+#    print('done. Found {}'.format(ls))
+#    print('searching database for {} ...'.format(ls), end='', flush=True)
+#    results = get_nmap(db=db,
+#        hosts=hosts,
+#        ports=ports,
+#        arguments=arguments,
+#        fetchall=True,
+#        days=days,
+#    )
+#    l = len(results)
+#    ls = '1 host' if l == 1 else str(l) + ' hosts'
+#    print('done. Found {}'.format(ls))
+#
+#    if results:
+#        hostd = [x[1] for x in results]
+#        hosts = [x for x in hosts if x not in hostd]
+#        for result in results:
+#            if not result[5][1]['scan']:
+#                hosts.append(result[0])
+#                continue
+#            print('read   : {}'.format(result[4]))
+#            set_dict(result[5][0], result[5][1])
+#
+#    hosts = self.sort_name_hosts(hosts)
+#    ports = self.sort_nmap_ports(ports)
+#    arguments = self.sort_nmap_arguments(arguments)
+#
+#    if hosts:
+#        psa = nmap.PortScannerAsync()
+#        l, hosts = host_list(hosts)
+#        ls = '1 host' if l == 1 else str(l) + ' hosts'
+#        print('scanning {}'.format(ls))
+#        print("Waiting for nmap ....")
+#        psa.scan(
+#            hosts=hosts,
+#            ports=ports,
+#            arguments=arguments,
+#            callback=save_entry,
+#            sudo=True,
+#            )
+#        while psa.still_scanning():
+#            print('.', end='', flush=True)
+#            psa.wait(10)
+#
+#    print('nmap scan done')
+#    return host_dict
+#
+#
+#def hosts_dict(
+#    arguments=None,
+#    days=None,
+#    domain=None,
+#    fqdn=None,
+#    hosts=None,
+#    ip_range=None,
+#    password=None,
+#    ports=None,
+#    server=None,
+#    user=None,
+#    scan_connected=False,
+#    scan_ip_range=False,
+#    dns_days=None,
+#    dns_domain=None,
+#    dns_password=None,
+#    dns_server=None,
+#    dns_user=None,
+#    ldap_days=None,
+#    ldap_domain=None,
+#    ldap_fqdn=None,
+#    ldap_password=None,
+#    ldap_server=None,
+#    ldap_user=None,
+#    nmap_arguments=None,
+#    nmap_days=None,
+#    nmap_fqdn=None,
+#    nmap_hosts=None,
+#    nmap_ip_range=None,
+#    nmap_ports=None,
+#    config_file=config['path'], config={},
+#    db=None, host_dict={},
+#    ):
+#
+#    global net_db
+#    if not db:
+#        if not net_db:
+#            net_db = db()
+#        db = net_db
+#
+#    if not config:
+#        config=globals()['config']
+#
+#    if config_file and os.path.isfile(config_file):
+#        parser.read(config_file)
+#        mergeConf(config, {
+#            k: dict(parser.items(k))
+#            for k in parser.sections()
+#        })
+#
+#    if not dns_server: dns_server = server if server else config.get('dns', {}).get('server', None)
+#    if not dns_user: dns_user = user if user else config.get('dns', {}).get('user', None)
+#    if not dns_domain: dns_domain = domain if domain else config.get('dns', {}).get('domain', None)
+#    if not dns_password: dns_password = password if password else config.get('dns', {}).get('password', None)
+#    if not dns_days: dns_days = days if days else config.get('dns', {}).get('days', None)
+#
+#    if not ldap_server: ldap_server = server if server else config.get('ldap', {}).get('server', None)
+#    if not ldap_fqdn: ldap_fqdn = fqdn if fqdn else config.get('ldap', {}).get('fqdn', None)
+#    if not ldap_user: ldap_user = user if user else config.get('ldap', {}).get('user', None)
+#    if not ldap_domain: ldap_domain = domain if domain else config.get('ldap', {}).get('domain', None)
+#    if not ldap_password: ldap_password = password if password else config.get('ldap', {}).get('password', None)
+#    if not ldap_days: ldap_days = days if days else config.get('ldap', {}).get('days', None)
+#
+#    if not nmap_hosts: nmap_hosts = hosts if hosts else config.get('nmap', {}).get('hosts', None)
+#    if not nmap_fqdn: nmap_fqdn = fqdn if fqdn else config.get('nmap', {}).get('fqdn', None)
+#    if not nmap_ip_range: nmap_ip_range = ip_range if ip_range else config.get('nmap', {}).get('ip_range', None)
+#    if not nmap_days: nmap_days = days if days else config.get('nmap', {}).get('days', None)
+#    if not nmap_ports: nmap_ports = ports if ports else config.get('nmap', {}).get('ports', None)
+#    if not nmap_arguments: nmap_arguments = arguments if arguments else config.get('nmap', {}).get('arguments', None)
+#
+#    dns_search(
+#        server=dns_server,
+#        user=dns_user,
+#        domain=dns_domain,
+#        password=dns_password,
+#        days=dns_days,
+#        db=db,
+#        host_dict=host_dict,
+#    )
+#
+#    ldap_search(
+#        server=ldap_server,
+#        fqdn=ldap_fqdn,
+#        domain=ldap_domain,
+#        user=ldap_user,
+#        password=ldap_password,
+#        days=ldap_days,
+#        db=db,
+#        host_dict=host_dict,
+#    )
+#
+#    nmap_scan(
+#        hosts=nmap_hosts,
+#        fqdn=nmap_fqdn,
+#        ip_range=nmap_ip_range,
+#        days=nmap_days,
+#        ports=nmap_ports,
+#        arguments=nmap_arguments,
+#        db=db,
+#        scan_connected=scan_connected,
+#        scan_ip_range=scan_ip_range,
+#        host_dict=host_dict,
+#    )
+#
+#    return host_dict
+#

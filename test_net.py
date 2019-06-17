@@ -1,46 +1,40 @@
 import unittest
 import net
 
+tables = 'host', 'dns', 'nmap', 'ldap'
+engines = 'mysql', 'postgres', 'sqlite'
+
 class TestNet(unittest.TestCase):
 
-    def test_mysql_init(self):
-        my_db = net.net_db(engine='mysql', init=True)
-        self.assertEqual(set(my_db.tables()), set(['dns', 'ldap', 'nmap']))
+    def test_db(self):
+        global tables
+        global engines
 
-    def test_mysql_full(self):
-        try:
-            my_db = net.net_db(engine='mysql', init=False)
-            host_dict = net.dns_search(db=my_db)
-            host_dict = net.ldap_search(db=my_db, host_dict=host_dict)
-            host_dict = net.nmap_scan(db=my_db, host_dict=host_dict, hosts='127.0.0.1')
-        except:
-            self.fail("test_mysql_full() raised an exception unexpectedly!")
+        def test_db_engine(engine):
+            def test_db_engine_assert():
+                self.assertEqual(set(db.tables()), set(tables))
+                self.assertEqual(db.engine, engine)
 
-    def test_postgres_init(self):
-        my_db = net.net_db(engine='postgres', init=True)
-        self.assertEqual(set(my_db.tables()), set(['dns', 'ldap', 'nmap']))
+            db = net._db(engine=engine, init=True)
+            test_db_engine_assert
+            db = net._db(engine=engine)
+            test_db_engine_assert
 
-    def test_postgres_full(self):
-        try:
-            my_db = net.net_db(engine='postgres', init=False)
-            host_dict = net.dns_search(db=my_db)
-            host_dict = net.ldap_search(db=my_db, host_dict=host_dict)
-            host_dict = net.nmap_scan(db=my_db, host_dict=host_dict, hosts='127.0.0.1')
-        except:
-            self.fail("test_postgres_full() raised an exception unexpectedly!")
+        for e in engines:
+            test_db_engine(e)
 
-    def test_sqlite_init(self):
-        my_db = net.net_db(engine='sqlite', init=True)
-        self.assertEqual(set(my_db.tables()), set(['dns', 'ldap', 'nmap']))
+    def test_dns_search(self):
+        global tables
+        net.dns_search()
+        self.assertTrue(isinstance(net.net_db, net._db))
+        engine1 = net.net_db.engine
+        for e in [x for x in engines if x != engine1]:
+            db = None
+            db = net._db(engine=e, set_db=False, set_hosts=False)
+            net.dns_search(db=db)
+            self.assertEqual(net.net_db.engine, engine1)
 
-    def test_sqlite_full(self):
-        try:
-            my_db = net.net_db(engine='sqlite', init=False)
-            host_dict = net.dns_search(db=my_db)
-            host_dict = net.ldap_search(db=my_db, host_dict=host_dict)
-            host_dict = net.nmap_scan(db=my_db, host_dict=host_dict, hosts='127.0.0.1')
-        except:
-            self.fail("test_sqlite_full() raised an exception unexpectedly!")
+
 
 if __name__ == '__main__':
     unittest.main()

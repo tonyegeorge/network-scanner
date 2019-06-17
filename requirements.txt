@@ -6,7 +6,6 @@ configparser==3.7.4
 cryptography==2.7
 idna==2.8
 IPy==1.0
-jsonpickle==1.2
 ldap3==2.6
 netifaces==0.10.9
 ntlm-auth==1.3.0
@@ -20,4 +19,5 @@ python-nmap==0.6.1
 requests==2.22.0
 requests-credssp==1.0.2
 six==1.12.0
+sqlparse==0.3.0
 urllib3==1.25.3
